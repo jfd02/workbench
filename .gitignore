@@ -1,0 +1,10 @@
+# Swift Package Manager
+.build/
+
+# scripts/bundle.sh output and the ghostty source checkout it clones
+build/
+
+# libghostty, rebuilt from source by scripts/build-ghostty.sh
+Frameworks/GhosttyKit.xcframework/
+
+.DS_Store
