@@ -95,4 +95,3 @@ private final class EmptyTerminal: TabContent {
     func setVisible(_ visible: Bool) {}
     func close() {}
 }
-
