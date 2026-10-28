@@ -322,6 +322,8 @@ final class TabBarView: NSView {
     private let scrollView = NSScrollView()
     private let plusButton = NSButton()
     private let sidebarButton = NSButton()
+    /// Fixed controls stay reachable when the tabs overflow and scroll.
+    let trailingControls = NSStackView()
 
     /// Height of the strip with no scroller taking space, and of the scroll
     /// view inside it. Both grow to make room when a scroller does.
@@ -402,6 +404,13 @@ final class TabBarView: NSView {
 
         addSubview(sidebarButton)
         addSubview(scrollView)
+        trailingControls.orientation = .horizontal
+        trailingControls.spacing = 10
+        trailingControls.alignment = .centerY
+        trailingControls.translatesAutoresizingMaskIntoConstraints = false
+        trailingControls.setContentHuggingPriority(.required, for: .horizontal)
+        trailingControls.setContentCompressionResistancePriority(.required, for: .horizontal)
+        addSubview(trailingControls)
 
         let separator = NSBox()
         separator.boxType = .separator
@@ -417,8 +426,10 @@ final class TabBarView: NSView {
 
             scrollView.leadingAnchor.constraint(
                 equalTo: sidebarButton.trailingAnchor, constant: 8),
-            scrollView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            scrollView.trailingAnchor.constraint(equalTo: trailingControls.leadingAnchor, constant: -12),
             scrollView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            trailingControls.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            trailingControls.centerYAnchor.constraint(equalTo: centerYAnchor),
 
             // The stack holds the tabs and, as its last item, the + button —
             // so + trails the last tab instead of being pinned to the edge.

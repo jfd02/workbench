@@ -511,7 +511,7 @@ final class SidebarViewController: NSViewController {
             ) { [weak self] _ in
                 guard let self else { return }
                 // Only the rows change, so don't disturb selection or expansion.
-                self.outlineView.reloadData()
+                self.refreshRows()
             }
         }
     }
@@ -524,16 +524,26 @@ final class SidebarViewController: NSViewController {
             return worktree
         }
         WorktreeActivity.refreshCodeChanges(for: worktrees) { [weak self] in
-            self?.outlineView.reloadData()
+            self?.refreshRows()
         }
     }
 
     /// Redraw the rows because an agent changed state. Only the dots move, so
     /// this leaves selection and expansion alone.
     func refreshAgentStates() {
-        outlineView.reloadData()
+        refreshRows()
         // An agent that just finished has likely been editing code.
         refreshCodeChanges()
+    }
+
+    /// Status updates change cells, not the tree. A full reloadData() drops
+    /// AppKit's selection even though the workspace itself hasn't changed.
+    private func refreshRows() {
+        outlineView.reloadData(
+            forRowIndexes: IndexSet(integersIn: 0..<outlineView.numberOfRows),
+            columnIndexes: IndexSet(integersIn: 0..<outlineView.numberOfColumns)
+        )
+        restoreSelection()
     }
 
     /// The dot a row should show.

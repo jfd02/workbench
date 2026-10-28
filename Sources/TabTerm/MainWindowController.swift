@@ -127,12 +127,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         ciButton.bezelStyle = .inline
         ciButton.toolTip = "Show CI checks for this commit (⇧⌘I)"
         ciButton.setAccessibilityIdentifier("showCI")
-        let reviewBar = NSStackView(views: [changesButton, ciButton, NSView()])
-        reviewBar.orientation = .horizontal
-        reviewBar.spacing = 16
-        reviewBar.edgeInsets = NSEdgeInsets(top: 3, left: 12, bottom: 3, right: 12)
-        reviewBar.translatesAutoresizingMaskIntoConstraints = false
-        main.addSubview(reviewBar)
+        for button in [changesButton, ciButton] {
+            button.setContentCompressionResistancePriority(.required, for: .horizontal)
+            tabBar.trailingControls.addArrangedSubview(button)
+        }
         main.addSubview(contentContainer)
         contentContainer.addSubview(emptyStateLabel)
 
@@ -141,11 +139,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             tabBar.leadingAnchor.constraint(equalTo: main.leadingAnchor),
             tabBar.trailingAnchor.constraint(equalTo: main.trailingAnchor),
 
-            reviewBar.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
-            reviewBar.leadingAnchor.constraint(equalTo: main.leadingAnchor),
-            reviewBar.trailingAnchor.constraint(equalTo: main.trailingAnchor),
-            reviewBar.heightAnchor.constraint(equalToConstant: 28),
-            contentContainer.topAnchor.constraint(equalTo: reviewBar.bottomAnchor),
+            contentContainer.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
             contentContainer.leadingAnchor.constraint(equalTo: main.leadingAnchor),
             contentContainer.trailingAnchor.constraint(equalTo: main.trailingAnchor),
             contentContainer.bottomAnchor.constraint(equalTo: main.bottomAnchor),
