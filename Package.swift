@@ -2,10 +2,15 @@
 import PackageDescription
 
 let package = Package(
-    name: "TabTerm",
+    name: "Workbench",
     platforms: [.macOS(.v14)],
+    products: [
+        .executable(name: "Workbench", targets: ["TabTerm"]),
+    ],
     dependencies: [
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0"),
+        // The wire protocol and terminal bookkeeping shared with the iPhone app.
+        .package(path: "TabTermKit"),
     ],
     targets: [
         // libghostty, built from source. See scripts/build-ghostty.sh.
@@ -14,11 +19,20 @@ let package = Package(
             path: "Frameworks/GhosttyKit.xcframework"
         ),
 
+        // Spawning a shell on a pty: the part that has to happen between fork
+        // and exec, where Swift can't safely run.
+        .target(
+            name: "CTabTermPTY",
+            path: "Sources/CTabTermPTY"
+        ),
+
         .executableTarget(
             name: "TabTerm",
             dependencies: [
                 "GhosttyKit",
+                "CTabTermPTY",
                 .product(name: "GRDB", package: "GRDB.swift"),
+                .product(name: "TabTermKit", package: "TabTermKit"),
             ],
             path: "Sources/TabTerm",
             linkerSettings: [
@@ -38,9 +52,9 @@ let package = Package(
                 .linkedFramework("MetalKit"),
                 .linkedFramework("QuartzCore"),
                 .linkedFramework("UserNotifications"),
-                .linkedFramework("WebKit"),
                 .linkedLibrary("c++"),
             ]
         ),
+        .testTarget(name: "WorkbenchTests", dependencies: ["TabTerm"], path: "Tests/WorkbenchTests"),
     ]
 )

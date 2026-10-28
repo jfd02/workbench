@@ -79,7 +79,7 @@ final class Workspace {
 
         guard !saved.isEmpty else {
             // First visit: start with a terminal in the workspace directory.
-            let tab = make(.pane(kind: "terminal", url: nil, directory: nil, focused: true))
+            let tab = make(.pane(directory: nil, agent: nil, focused: true))
             tabs = [tab]
             selectedID = tab.id
             return
@@ -101,12 +101,8 @@ final class Workspace {
 
         let rows = tabs.map { tab in
             let layout = Self.layout(of: tab.root, focusedPaneID: tab.focusedPaneID)
-            // kind and url describe the focused pane, which is what the tab bar
-            // shows; the full tree lives in `layout`.
             return SavedTab(
                 worktreeId: key.worktreeId,
-                kind: tab.kind == .browser ? "browser" : "terminal",
-                url: (tab.focusedPane?.content as? BrowserTabContent)?.currentURL?.absoluteString,
                 position: 0,
                 isSelected: tab.id == selectedID,
                 layout: layout.json
@@ -118,31 +114,20 @@ final class Workspace {
     /// Turn a live pane tree into its storable form.
     private static func layout(of node: SplitNode, focusedPaneID: UUID?) -> SavedLayout {
         if let pane = node.pane {
-            switch pane.content {
-            case let browser as BrowserTabContent:
-                return .pane(
-                    kind: "browser",
-                    url: browser.currentURL?.absoluteString,
-                    directory: nil,
-                    focused: pane.id == focusedPaneID
-                )
-            case let terminal as TerminalTabContent:
-                // Remember where the shell ended up, not just where it started.
-                return .pane(
-                    kind: "terminal",
-                    url: nil,
-                    directory: terminal.pwd,
-                    focused: pane.id == focusedPaneID
-                )
-            default:
-                return .pane(kind: "terminal", url: nil, directory: nil, focused: false)
-            }
+            // Remember where the shell ended up, not just where it started, and
+            // which agent session was live in it — if any still is.
+            let terminal = pane.content as? TerminalTabContent
+            return .pane(
+                directory: terminal?.pwd,
+                agent: terminal?.agentSession,
+                focused: pane.id == focusedPaneID
+            )
         }
 
         guard let first = node.children.first, let second = node.children.last,
               node.children.count == 2
         else {
-            return .pane(kind: "terminal", url: nil, directory: nil, focused: false)
+            return .pane(directory: nil, agent: nil, focused: false)
         }
 
         return .split(

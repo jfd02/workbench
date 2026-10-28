@@ -37,18 +37,25 @@ final class Tab {
     var panes: [Pane] { tree.panes }
     var paneCount: Int { tree.paneCount }
 
+    var agentIDs: [String] {
+        panes.compactMap { ($0.content as? TerminalTabContent)?.agentID }
+    }
+
     var focusedPane: Pane? {
         guard let focusedPaneID else { return panes.first }
         return tree.pane(for: focusedPaneID) ?? panes.first
     }
 
-    /// The tab bar shows the focused pane's title, kind and icon.
-    var title: String { focusedPane?.content.title ?? "TabTerm" }
-    var kind: TabKind { focusedPane?.content.kind ?? .terminal }
+    /// The tab bar shows the focused pane's title and icon.
+    var title: String { focusedPane?.content.title ?? "Workbench" }
     var icon: NSImage? { focusedPane?.content.icon }
 
-    init(content: TabContent) {
-        let pane = Pane(content: content)
+    convenience init(content: TabContent) {
+        self.init(pane: Pane(content: content))
+    }
+
+    /// Reuse a live pane when moving it out of another tab.
+    init(pane: Pane) {
         tree = SplitTree(pane: pane)
         focusedPaneID = pane.id
 
@@ -140,6 +147,22 @@ final class Tab {
         return root
     }
 
+    /// Remove a split without closing its content. The last pane stays put.
+    func detachPane(_ paneID: UUID) -> Pane? {
+        guard let leaf = tree.leaf(for: paneID), let pane = leaf.pane else { return nil }
+        let order = panes.map(\.id)
+        guard tree.remove(leaf) else { return nil }
+
+        container.rebuild()
+        if focusedPaneID == paneID {
+            let index = order.firstIndex(of: paneID) ?? 0
+            let remaining = panes.map(\.id)
+            // The destination tab will claim the keyboard after the move.
+            focusPane(remaining[min(index, remaining.count - 1)], moveResponder: false)
+        }
+        return pane
+    }
+
     /// Close one pane. Returns false when it was the last one, which means the
     /// whole tab should close.
     @discardableResult
@@ -206,8 +229,8 @@ final class Tab {
         }
     }
 
-    /// Track focus wherever it lands, including clicks into a web view, by
-    /// mapping the window's first responder back to the pane that contains it.
+    /// Track focus wherever it lands by mapping the window's first responder
+    /// back to the pane that contains it.
     func firstResponderDidChange(_ responder: NSResponder?) {
         var view = responder as? NSView
         while let current = view {

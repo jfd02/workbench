@@ -6,11 +6,6 @@ struct GitWorktree: Equatable {
     /// Branch short name, or nil when the worktree is detached.
     var branch: String?
     var isMain: Bool
-    var isLocked: Bool
-
-    var displayName: String {
-        branch ?? URL(fileURLWithPath: path).lastPathComponent
-    }
 }
 
 enum GitError: LocalizedError {
@@ -27,6 +22,20 @@ enum GitError: LocalizedError {
         case .commandFailed(let message):
             return message
         }
+    }
+}
+
+/// A branch the new-worktree sheet can check out.
+struct BranchChoice: Equatable {
+    /// Local branch name the worktree will be on.
+    var name: String
+    /// "origin/foo" when this only exists on a remote; a local branch is
+    /// created from it, tracking it.
+    var remoteRef: String?
+
+    var remoteName: String? {
+        guard let remoteRef else { return nil }
+        return String(remoteRef.dropLast(name.count + 1))
     }
 }
 
@@ -103,7 +112,6 @@ enum GitService {
         var result: [GitWorktree] = []
         var path: String?
         var branch: String?
-        var locked = false
 
         func flush() {
             guard let path else { return }
@@ -112,12 +120,10 @@ enum GitService {
                     path: path,
                     branch: branch,
                     // git always lists the main working tree first.
-                    isMain: result.isEmpty,
-                    isLocked: locked
+                    isMain: result.isEmpty
                 )
             )
             branch = nil
-            locked = false
         }
 
         for line in output.components(separatedBy: .newlines) {
@@ -130,8 +136,6 @@ enum GitService {
                 branch = ref.hasPrefix("refs/heads/")
                     ? String(ref.dropFirst("refs/heads/".count))
                     : ref
-            } else if line == "locked" || line.hasPrefix("locked ") {
-                locked = true
             }
         }
         flush()
@@ -157,6 +161,39 @@ enum GitService {
         return Set(trees.compactMap(\.branch))
     }
 
+    /// Branches a new worktree could check out: unused local branches, then
+    /// remote branches with no local counterpart. Each group most recent first.
+    static func branchChoices(for repositoryPath: String) -> [BranchChoice] {
+        let local = (try? branches(for: repositoryPath)) ?? []
+        let checkedOut = checkedOutBranches(for: repositoryPath)
+        var choices = local
+            .filter { !checkedOut.contains($0) }
+            .map { BranchChoice(name: $0, remoteRef: nil) }
+
+        // lstrip=2 gives "origin/feature/x", lstrip=3 gives "feature/x".
+        let output = (try? run(
+            ["for-each-ref", "--format=%(refname:lstrip=2)%09%(refname:lstrip=3)",
+             "--sort=-committerdate", "refs/remotes"],
+            in: repositoryPath
+        )) ?? ""
+        // A remote branch that already has a local one (used or not) is that
+        // branch; and the same name on two remotes shows once.
+        var seen = Set(local)
+        for line in output.components(separatedBy: .newlines) {
+            let parts = line.components(separatedBy: "\t")
+            guard parts.count == 2, !parts[1].isEmpty, parts[1] != "HEAD",
+                  seen.insert(parts[1]).inserted
+            else { continue }
+            choices.append(BranchChoice(name: parts[1], remoteRef: parts[0]))
+        }
+        return choices
+    }
+
+    /// Update every remote's branches, dropping ones deleted upstream.
+    static func fetchAll(repositoryPath: String) throws {
+        try run(["fetch", "--all", "--prune", "--quiet"], in: repositoryPath)
+    }
+
     /// Default location for a new worktree: a sibling `<repo>-worktrees` folder.
     static func defaultWorktreePath(repositoryPath: String, branch: String) -> String {
         let repoURL = URL(fileURLWithPath: repositoryPath)
@@ -168,14 +205,35 @@ enum GitService {
         return container.appendingPathComponent(folder, isDirectory: true).path
     }
 
+    /// Fetch `origin` and return its default branch (e.g. "origin/master"), so new
+    /// branches start from what's on the remote rather than a stale local HEAD.
+    /// nil when there's no origin or it can't be reached.
+    static func freshRemoteBase(for repositoryPath: String) -> String? {
+        let remotes = (try? run(["remote"], in: repositoryPath)) ?? ""
+        guard remotes.components(separatedBy: .newlines).contains("origin"),
+              (try? run(["fetch", "--quiet", "origin"], in: repositoryPath)) != nil
+        else { return nil }
+
+        if let head = try? run(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], in: repositoryPath) {
+            let trimmed = head.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        // origin/HEAD isn't set when the repo wasn't cloned; guess the usual names.
+        return ["origin/master", "origin/main"].first { ref in
+            (try? run(["rev-parse", "--verify", "--quiet", ref], in: repositoryPath)) != nil
+        }
+    }
+
     /// Create a worktree. When `createBranch` is true the branch is created from
-    /// `startPoint` (or the current HEAD), otherwise an existing branch is used.
+    /// `startPoint`, or else from a freshly fetched origin default branch (falling
+    /// back to the current HEAD). Otherwise an existing branch is used.
     static func addWorktree(
         repositoryPath: String,
         path: String,
         branch: String,
         createBranch: Bool,
-        startPoint: String? = nil
+        startPoint: String? = nil,
+        track: Bool = false
     ) throws {
         try FileManager.default.createDirectory(
             at: URL(fileURLWithPath: path).deletingLastPathComponent(),
@@ -184,12 +242,40 @@ enum GitService {
 
         var arguments = ["worktree", "add"]
         if createBranch {
-            arguments += ["-b", branch, path]
-            if let startPoint, !startPoint.isEmpty { arguments.append(startPoint) }
+            if let startPoint, !startPoint.isEmpty {
+                if track { arguments.append("--track") }
+                arguments += ["-b", branch, path, startPoint]
+            } else if let remoteBase = freshRemoteBase(for: repositoryPath) {
+                // --no-track so the new branch doesn't treat origin/master as its upstream.
+                arguments += ["--no-track", "-b", branch, path, remoteBase]
+            } else {
+                arguments += ["-b", branch, path]
+            }
         } else {
             arguments += [path, branch]
         }
         try run(arguments, in: repositoryPath)
+    }
+
+    /// The worktree a bare branch name asks for, for a client that can't be
+    /// shown the sheet. It decides what the sheet's two modes decide between:
+    /// a local branch is checked out, one that only exists on a remote gets a
+    /// local branch tracking it, and any other name is a new branch.
+    ///
+    /// Remotes are fetched first unless the branch is already here — the
+    /// sheet does the same when it opens — so a branch pushed a minute ago is
+    /// found on its remote rather than created again from scratch.
+    static func worktreeRequest(repositoryPath: String, branch: String) -> NewWorktreeRequest {
+        let path = defaultWorktreePath(repositoryPath: repositoryPath, branch: branch)
+        if ((try? branches(for: repositoryPath)) ?? []).contains(branch) {
+            return NewWorktreeRequest(branch: branch, path: path, createBranch: false, startPoint: nil)
+        }
+
+        try? fetchAll(repositoryPath: repositoryPath)
+        let remote = branchChoices(for: repositoryPath).first { $0.name == branch }?.remoteRef
+        return NewWorktreeRequest(
+            branch: branch, path: path, createBranch: true,
+            startPoint: remote, trackStartPoint: remote != nil)
     }
 
     static func removeWorktree(
@@ -201,5 +287,20 @@ enum GitService {
         if force { arguments.append("--force") }
         arguments.append(path)
         try run(arguments, in: repositoryPath)
+    }
+
+    /// Forget worktrees whose folders have been deleted.
+    static func pruneWorktrees(repositoryPath: String) throws {
+        try run(["worktree", "prune"], in: repositoryPath)
+    }
+
+    /// The shared `.git` directory, which is the same for every worktree.
+    static func commonDirectory(for repositoryPath: String) -> String? {
+        guard let output = try? run(
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            in: repositoryPath
+        ) else { return nil }
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

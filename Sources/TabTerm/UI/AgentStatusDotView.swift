@@ -1,4 +1,5 @@
 import AppKit
+import TabTermKit
 
 /// The dot on the right of a sidebar row saying what an agent is doing in it.
 ///
@@ -12,7 +13,7 @@ import AppKit
 final class AgentStatusDotView: NSView {
     static let diameter: CGFloat = 8
 
-    private(set) var state: AgentState = .idle
+    private(set) var state: AgentStatus = .idle
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -29,7 +30,7 @@ final class AgentStatusDotView: NSView {
         NSSize(width: Self.diameter, height: Self.diameter)
     }
 
-    func setState(_ newState: AgentState) {
+    func setState(_ newState: AgentStatus) {
         let changed = newState != state
         state = newState
 
@@ -68,7 +69,7 @@ final class AgentStatusDotView: NSView {
         layer?.add(pulse, forKey: Self.pulseKey)
     }
 
-    static func color(for state: AgentState) -> NSColor {
+    static func color(for state: AgentStatus) -> NSColor {
         switch state {
         case .idle: return .clear
         // The same orange the tab already draws Claude's mark in.
@@ -77,12 +78,12 @@ final class AgentStatusDotView: NSView {
         }
     }
 
-    static func tooltip(for state: AgentState) -> String? {
+    static func tooltip(for state: AgentStatus) -> String? {
         switch state {
         case .idle: return nil
-        case .working: return "Claude is working here"
-        case .finished: return "Claude finished — waiting for you"
-        case .blocked: return "Claude is waiting for your answer"
+        case .working: return "Agent is working here"
+        case .finished: return "Agent finished — waiting for you"
+        case .blocked: return "Agent is waiting for your answer"
         }
     }
 }

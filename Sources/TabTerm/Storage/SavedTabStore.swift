@@ -6,7 +6,7 @@ import GRDB
 /// Mirrors `SplitNode`: a leaf holds one piece of content, a split holds two
 /// children and the divider position between them.
 indirect enum SavedLayout: Codable, Equatable {
-    case pane(kind: String, url: String?, directory: String?, focused: Bool)
+    case pane(directory: String?, agent: AgentSession?, focused: Bool)
     case split(stacked: Bool, ratio: Double, first: SavedLayout, second: SavedLayout)
 
     /// Leaves left to right, top to bottom — the same order as `SplitNode.panes`.
@@ -18,22 +18,18 @@ indirect enum SavedLayout: Codable, Equatable {
     }
 
     var isFocused: Bool {
-        if case .pane(_, _, _, let focused) = self { return focused }
+        if case .pane(_, _, let focused) = self { return focused }
         return false
     }
 
-    var tabKind: TabKind {
-        if case .pane(let kind, _, _, _) = self, kind == "browser" { return .browser }
-        return .terminal
-    }
-
-    var url: URL? {
-        if case .pane(_, let url, _, _) = self { return url.flatMap(URL.init(string:)) }
+    var directory: String? {
+        if case .pane(let directory, _, _) = self { return directory }
         return nil
     }
 
-    var directory: String? {
-        if case .pane(_, _, let directory, _) = self { return directory }
+    /// The agent that was running in this pane, if one was.
+    var agent: AgentSession? {
+        if case .pane(_, let agent, _) = self { return agent }
         return nil
     }
 
@@ -52,16 +48,16 @@ indirect enum SavedLayout: Codable, Equatable {
 
 /// A tab as persisted between launches.
 ///
-/// Terminals come back as fresh shells rooted at the workspace directory —
-/// scrollback and running processes can't be restored.
+/// Terminals come back as fresh shells rooted at the directory they ended up
+/// in; scrollback and running processes can't be restored. A coding agent is
+/// the exception: it keeps its own transcript, so a pane that was running one
+/// records the session and types it back on restore.
 struct SavedTab: Codable, Equatable, Identifiable, FetchableRecord, MutablePersistableRecord {
     static let databaseTableName = "savedTab"
 
     var id: Int64?
     /// nil is the Home workspace.
     var worktreeId: Int64?
-    var kind: String
-    var url: String?
     var position: Int
     var isSelected: Bool
     /// The pane tree as JSON. Rows written before splits existed have none.
@@ -71,14 +67,15 @@ struct SavedTab: Codable, Equatable, Identifiable, FetchableRecord, MutablePersi
         id = inserted.rowID
     }
 
-    var tabKind: TabKind {
-        kind == "browser" ? .browser : .terminal
-    }
-
     /// The stored tree, falling back to a single pane for pre-split rows.
+    ///
+    /// Layouts written by builds that still had a browser carry `kind` and
+    /// `url` keys; decoding ignores them, so those panes come back as
+    /// terminals rather than losing the whole tree. Ones written before agents
+    /// were restored carry no `agent` key, which decodes as nil for the same
+    /// reason.
     var savedLayout: SavedLayout {
-        SavedLayout(json: layout)
-            ?? .pane(kind: kind, url: url, directory: nil, focused: true)
+        SavedLayout(json: layout) ?? .pane(directory: nil, agent: nil, focused: true)
     }
 }
 
@@ -112,8 +109,6 @@ enum SavedTabStore {
             for (index, tab) in tabs.enumerated() {
                 var row = SavedTab(
                     worktreeId: worktreeId,
-                    kind: tab.kind,
-                    url: tab.url,
                     position: index,
                     isSelected: tab.isSelected,
                     layout: tab.layout

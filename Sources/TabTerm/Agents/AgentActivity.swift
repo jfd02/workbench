@@ -1,37 +1,35 @@
 import Foundation
-
-/// What the agent in one terminal is doing.
-///
-/// Ordered by how much it wants the user: a worktree showing several terminals
-/// takes the highest state among them, so one prompt waiting for an answer is
-/// never hidden behind another pane's progress bar.
-enum AgentState: Int, Comparable {
-    /// No agent, or one that has been seen and has nothing to say.
-    case idle = 0
-    /// Claude is running: thinking, or between tool calls.
-    case working = 1
-    /// The turn ended and the user hasn't looked since.
-    case finished = 2
-    /// Claude is stopped on a prompt and can't continue without an answer.
-    case blocked = 3
-
-    static func < (a: AgentState, b: AgentState) -> Bool { a.rawValue < b.rawValue }
-
-    /// Whether this is the "your turn" red, rather than the working amber.
-    var wantsAttention: Bool { self == .finished || self == .blocked }
-}
+import TabTermKit
 
 /// The last thing a terminal's agent reported.
 struct AgentReport: Equatable {
-    var state: AgentState
+    var state: AgentStatus
     var at: Date
+
+    /// Which agent said so, as it named itself: `claude` or `codex`. Only the
+    /// hook knows this; the file left behind by a previous agent in the same
+    /// terminal is otherwise indistinguishable from a current one.
+    var agent: String?
+
+    /// The session the agent is in, and where it keeps the transcript, so the
+    /// terminal can be brought back to it after a restart. Empty when the hook
+    /// couldn't find them in the payload.
+    var sessionID: String?
+    var transcript: String?
+    var turnID: String?
+
+    /// A directory watch may coalesce the working event between two turns.
+    /// The timestamp still distinguishes the new completion from the old one.
+    func isNewCompletion(after previous: AgentReport?) -> Bool {
+        state == .finished && (previous?.state != .finished || previous?.at != at)
+    }
 }
 
 /// Which terminals have an agent in them, and what it is doing.
 ///
 /// Nothing in a terminal announces this, so Claude Code is asked to say so
-/// itself: `ClaudeHooks` registers a hook script on the events that mark the
-/// edges of a turn, and each TabTerm terminal exports `TABTERM_AGENT_ID` and
+/// itself: `AgentHooks` registers a hook script on the events that mark the
+/// edges of a turn, and each Workbench terminal exports `TABTERM_AGENT_ID` and
 /// `TABTERM_AGENT_DIR` so the script knows which terminal it is running in and
 /// where to leave the answer. The script writes one small JSON file per
 /// terminal; this watches that directory and turns the events back into state.
@@ -51,6 +49,10 @@ final class AgentActivityStore {
     /// Called on the main queue after anything changes.
     var onChange: (() -> Void)?
 
+    /// Posted on the main queue when an agent reports something new, for
+    /// anyone besides the window that cares — the phone's notifications.
+    static let didChange = Notification.Name("AgentActivityStoreDidChange")
+
     let directory: URL
 
     private(set) var reports: [String: AgentReport] = [:]
@@ -58,6 +60,10 @@ final class AgentActivityStore {
     /// Agents whose finished turn the user has already been shown. Kept out of
     /// `reports` so a later event can clear it without a second write.
     private var acknowledged: Set<String> = []
+    /// Recovery changes presentation only; it never invents a completion chime.
+    private var recoveredStates: [String: AgentStatus] = [:]
+    private var nativeRevisions: [String: UUID] = [:]
+    private var transcriptReads: Set<String> = []
 
     private var source: DispatchSourceFileSystemObject?
 
@@ -93,6 +99,8 @@ final class AgentActivityStore {
         }
         reports.removeAll()
         acknowledged.removeAll()
+        recoveredStates.removeAll()
+        nativeRevisions.removeAll()
         watch()
     }
 
@@ -140,6 +148,10 @@ final class AgentActivityStore {
         struct Row: Decodable {
             var event: String
             var at: TimeInterval
+            var agent: String?
+            var session: String?
+            var transcript: String?
+            var turn: String?
         }
 
         var next: [String: AgentReport] = [:]
@@ -148,31 +160,70 @@ final class AgentActivityStore {
                   let row = try? JSONDecoder().decode(Row.self, from: data),
                   let state = Self.state(forEvent: row.event)
             else { continue }
-            next[url.deletingPathExtension().lastPathComponent] = AgentReport(
+            let id = url.deletingPathExtension().lastPathComponent
+            // The delayed idle reminder repairs stale working state, but must
+            // not erase a real completion the user hasn't visited yet.
+            if row.event == "IdlePrompt", reports[id]?.state == .finished {
+                next[id] = reports[id]
+                continue
+            }
+            next[id] = AgentReport(
                 state: state,
-                at: Date(timeIntervalSince1970: row.at)
+                at: Date(timeIntervalSince1970: row.at),
+                agent: row.agent.flatMap { $0.isEmpty ? nil : $0 },
+                sessionID: row.session.flatMap { $0.isEmpty ? nil : $0 },
+                transcript: row.transcript.flatMap { $0.isEmpty ? nil : $0 },
+                turnID: row.turn.flatMap { $0.isEmpty ? nil : $0 }
             )
         }
 
         guard next != reports else { return }
-        reports = next
+        // A fresh hook is authoritative; an unrelated terminal's update must
+        // not undo a recovery by rereading the same stale file.
+        for id in Set(reports.keys).union(next.keys) where reports[id] != next[id] {
+            recoveredStates.removeValue(forKey: id)
+            nativeRevisions.removeValue(forKey: id)
+        }
         // An agent that started working again has something new to say, so
-        // whatever the user acknowledged before no longer applies.
-        acknowledged = acknowledged.filter { reports[$0]?.state == .finished }
+        // whatever the user acknowledged before no longer applies. A newer
+        // completion also counts when the watch missed the intervening work.
+        acknowledged = acknowledged.filter { id in
+            next[id]?.state == .finished && next[id]?.isNewCompletion(after: reports[id]) == false
+        }
+        // Only the live store emits user hooks; fixture stores and display-only
+        // acknowledgements must never launch scripts.
+        if self === Self.shared {
+            WorkbenchHooks.agentReportsChanged(previous: reports, current: next)
+        }
+        reports = next
         onChange?()
+        NotificationCenter.default.post(name: Self.didChange, object: self)
     }
 
     // MARK: - State
 
     /// What to show for one terminal, allowing for what the user has seen.
-    func state(ofAgent agentID: String) -> AgentState {
+    func state(ofAgent agentID: String) -> AgentStatus {
+        if let recovered = recoveredStates[agentID] { return recovered }
         guard let report = reports[agentID] else { return .idle }
         if report.state == .finished, acknowledged.contains(agentID) { return .idle }
         return report.state
     }
 
+    /// The session one terminal's agent last reported being in.
+    ///
+    /// `agent` guards against a file left behind by a different agent in the
+    /// same terminal: a claude session id would be meaningless to codex.
+    func session(ofAgent agentID: String, running agent: ForegroundProcess.Agent) -> (
+        id: String, transcript: String?
+    )? {
+        guard let report = reports[agentID], let sessionID = report.sessionID else { return nil }
+        guard report.agent == nil || report.agent == agent.rawValue else { return nil }
+        return (sessionID, report.transcript)
+    }
+
     /// The most demanding state across a set of terminals.
-    func state(ofAgents agentIDs: [String]) -> AgentState {
+    func state(ofAgents agentIDs: [String]) -> AgentStatus {
         agentIDs.map(state(ofAgent:)).max() ?? .idle
     }
 
@@ -195,25 +246,81 @@ final class AgentActivityStore {
             at: directory.appendingPathComponent("\(agentID).json")
         )
         acknowledged.remove(agentID)
-        guard reports.removeValue(forKey: agentID) != nil else { return }
+        nativeRevisions.removeValue(forKey: agentID)
+        let recovered = recoveredStates.removeValue(forKey: agentID)
+        guard reports.removeValue(forKey: agentID) != nil || recovered != nil else { return }
+        onChange?()
+    }
+
+    /// A native Claude report can repair missed hooks. Let a late Stop land
+    /// first, and never clear a permission prompt merely because work stopped.
+    func receiveNativeState(_ state: AgentStatus, forAgent id: String) {
+        guard reports[id]?.agent == nil || reports[id]?.agent == "claude" else { return }
+        let revision = UUID()
+        nativeRevisions[id] = revision
+        if state == .working || state == .blocked {
+            recover(state, forAgent: id)
+            return
+        }
+        let expected = reports[id]
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.nativeRevisions[id] == revision,
+                  self.reports[id] == expected, self.state(ofAgent: id) == .working else { return }
+            self.recover(.idle, forAgent: id)
+        }
+    }
+
+    /// The pty is back at its shell after an agent exited without SessionEnd.
+    func agentReturnedToShell(_ id: String) {
+        nativeRevisions[id] = UUID()
+        let state = state(ofAgent: id)
+        if state == .working || state == .blocked { recover(.idle, forAgent: id) }
+    }
+
+    /// Read a bounded tail off the UI thread, and discard it if a hook arrived
+    /// while the read was in flight. Unknown transcript formats leave hooks alone.
+    func checkCodexTranscript(forAgent id: String) {
+        guard let report = reports[id], report.agent == "codex",
+              let path = report.transcript, !transcriptReads.contains(id) else { return }
+        transcriptReads.insert(id)
+        let expectedRevision = nativeRevisions[id]
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let observation = CodexTranscriptActivity.read(path: path)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.transcriptReads.remove(id)
+                guard self.reports[id] == report, self.nativeRevisions[id] == expectedRevision,
+                      let observation, observation.follows(report) else { return }
+                // Keep real Stop notifications unread until visited. Recovery
+                // repairs running/waiting without announcing an invented Stop.
+                if observation.state == .idle, report.state == .finished || report.state == .idle { return }
+                self.recover(observation.state, forAgent: id)
+            }
+        }
+    }
+
+    private func recover(_ state: AgentStatus, forAgent id: String) {
+        guard self.state(ofAgent: id) != state else { return }
+        recoveredStates[id] = state
         onChange?()
     }
 
     /// What one hook event says the agent is now doing.
     ///
-    /// Only the events TabTerm registers are mapped; anything else is ignored
+    /// Only the events Workbench registers are mapped; anything else is ignored
     /// so an unrelated hook in the user's own settings can't move the dot.
-    static func state(forEvent event: String) -> AgentState? {
+    static func state(forEvent event: String) -> AgentStatus? {
         switch event {
         // A session that just started, or has just gone, is waiting on nothing.
-        case "SessionStart", "SessionEnd":
+        case "SessionStart", "SessionEnd", "Interrupt", "IdlePrompt":
             return .idle
         // The turn is under way. PostToolUse is what brings a blocked agent
         // back to working once the user has answered the prompt.
-        case "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "PermissionDenied":
+        case "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionDenied",
+             "PreCompact", "PostCompact", "ElicitationResult":
             return .working
         // Stopped on something only the user can resolve.
-        case "PermissionRequest", "Notification":
+        case "PermissionRequest", "Notification", "Elicitation":
             return .blocked
         // The turn is over, one way or the other.
         case "Stop", "StopFailure":

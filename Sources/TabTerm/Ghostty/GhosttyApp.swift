@@ -153,6 +153,17 @@ final class GhosttyApp {
             ?? .black
     }
 
+    /// `shell-integration`: `detect`, `none`, or a shell to force. Sessions
+    /// inject the integration themselves, so they have to honour this.
+    var shellIntegrationMode: String? {
+        guard let config else { return nil }
+        var value: UnsafePointer<CChar>?
+        let key = "shell-integration"
+        let ok = ghostty_config_get(config, &value, key, UInt(key.utf8.count))
+        guard ok, let value else { return nil }
+        return String(cString: value)
+    }
+
     /// 1 means no dimming; Ghostty's default is 0.7.
     var unfocusedSplitOpacity: Double {
         guard let value = configValue("unfocused-split-opacity", Double(0)), value > 0 else {
@@ -248,7 +259,7 @@ final class GhosttyApp {
 
         case GHOSTTY_ACTION_NEW_TAB:
             DispatchQueue.main.async {
-                MainWindowController.current?.presentNewTabDialog()
+                MainWindowController.current?.addTab()
             }
             return true
 
@@ -306,7 +317,7 @@ final class GhosttyApp {
         guard let view = surfaceView(from: userdata),
               let surface = view.surface,
               let pasteboard = pasteboard(location),
-              let str = pasteboard.string(forType: .string)
+              let str = pasteboard.terminalStringContents()
         else { return false }
 
         str.withCString { ptr in

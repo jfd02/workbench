@@ -5,15 +5,15 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>TabTerm</string>
+	<string>Workbench</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.tabterm.TabTerm</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>TabTerm</string>
+	<string>Workbench</string>
 	<key>CFBundleDisplayName</key>
-	<string>TabTerm</string>
+	<string>Workbench</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

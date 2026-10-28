@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build TabTerm and assemble it into a runnable .app bundle.
+# Build Workbench and assemble it into a runnable .app bundle.
 #
 # Usage: scripts/bundle.sh [debug|release]
 set -euo pipefail
@@ -8,12 +8,12 @@ CONFIG="${1:-release}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-APP="$ROOT/build/TabTerm.app"
+APP="$ROOT/build/Workbench.app"
 CONTENTS="$APP/Contents"
 
 echo "==> Building ($CONFIG)"
 swift build -c "$CONFIG"
-BIN="$(swift build -c "$CONFIG" --show-bin-path)/TabTerm"
+BIN="$(swift build -c "$CONFIG" --show-bin-path)/Workbench"
 
 if [ ! -x "$BIN" ]; then
     echo "error: built binary not found at $BIN" >&2
@@ -24,7 +24,7 @@ echo "==> Assembling $APP"
 rm -rf "$APP"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 
-cp "$BIN" "$CONTENTS/MacOS/TabTerm"
+cp "$BIN" "$CONTENTS/MacOS/Workbench"
 cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
 
 # libghostty locates its resources by walking up from the executable looking

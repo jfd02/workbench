@@ -46,23 +46,39 @@ enum ForegroundProcess {
         return [executable] + arguments
     }
 
-    static func isClaude(pid: pid_t) -> Bool {
-        isClaude(commandLine: commandLine(of: pid))
+    /// A coding agent Workbench knows how to pick back up.
+    enum Agent: String {
+        case claude
+        case codex
     }
 
-    /// Whether a command line is Claude Code.
+    static func agent(pid: pid_t) -> Agent? {
+        agent(commandLine: commandLine(of: pid))
+    }
+
+    /// Which agent a command line is, if any.
     ///
     /// Only the executable and the first couple of arguments are considered,
-    /// which covers the shapes it actually runs as — a `claude` binary, and
-    /// `node .../@anthropic-ai/claude-code/cli.js` from an npm install —
-    /// without matching an editor that happens to have been handed a file
-    /// called `claude.md`.
-    static func isClaude(commandLine: [String]) -> Bool {
+    /// which covers the shapes they actually run as — a `claude` or `codex`
+    /// binary, and `node .../@anthropic-ai/claude-code/cli.js` from an npm
+    /// install — without matching an editor that happens to have been handed a
+    /// file called `claude.md`.
+    static func agent(commandLine: [String]) -> Agent? {
         for argument in commandLine.prefix(3) {
             let name = (argument as NSString).lastPathComponent
-            if name == "claude" || name == "claude-code" { return true }
-            if argument.contains("@anthropic-ai/claude-code") { return true }
+            if name == "claude" || name == "claude-code" { return .claude }
+            if name == "codex" { return .codex }
+            if argument.contains("@anthropic-ai/claude-code") { return .claude }
+            if argument.contains("@openai/codex") { return .codex }
         }
-        return false
+        return nil
+    }
+
+    static func isClaude(pid: pid_t) -> Bool {
+        agent(pid: pid) == .claude
+    }
+
+    static func isClaude(commandLine: [String]) -> Bool {
+        agent(commandLine: commandLine) == .claude
     }
 }

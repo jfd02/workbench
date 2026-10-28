@@ -6,7 +6,7 @@ import GhosttyKit
 extension Ghostty {
     struct Input {}
 
-    // NOTE: Ghostty's `keyboardShortcut(for:)` helper was dropped here. TabTerm
+    // NOTE: Ghostty's `keyboardShortcut(for:)` helper was dropped here. Workbench
     // builds its menu with plain AppKit key equivalents, and the helper pulled
     // in more of Ghostty's app-level SwiftUI extensions than we need.
 

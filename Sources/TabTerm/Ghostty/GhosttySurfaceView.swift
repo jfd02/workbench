@@ -15,6 +15,10 @@ final class GhosttySurfaceView: NSView, NSTextInputClient {
     /// Called when the terminal reports a new title.
     var onTitleChange: ((String) -> Void)?
 
+    /// The shell reported a directory. Also the first sign that it has finished
+    /// starting up, which is when it is safe to type at it.
+    var onPwdChange: ((String) -> Void)?
+
     /// Called when the surface wants to go away. The flag is true when the user
     /// asked for it (a close binding) and false when the child process exited.
     var onClose: ((_ confirm: Bool) -> Void)?
@@ -60,6 +64,8 @@ final class GhosttySurfaceView: NSView, NSTextInputClient {
         environment: [String: String] = [:]
     ) {
         super.init(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+
+        registerForDraggedTypes(Array(Self.dropTypes))
 
         guard let app = GhosttyApp.shared.app else {
             error = GhosttyApp.shared.startupError ?? "libghostty unavailable"
@@ -149,6 +155,7 @@ final class GhosttySurfaceView: NSView, NSTextInputClient {
 
     func pwdDidChange(_ pwd: String) {
         self.pwd = pwd
+        onPwdChange?(pwd)
     }
 
     /// The child process exited, so the surface is finished. Nothing to confirm.
@@ -176,18 +183,9 @@ final class GhosttySurfaceView: NSView, NSTextInputClient {
         onEqualizeSplits?()
     }
 
-    /// True when something beyond the shell is still running, per libghostty.
-    var hasRunningProcess: Bool {
-        guard let surface else { return false }
-        return ghostty_surface_needs_confirm_quit(surface)
-    }
-
-    /// The pty's foreground process — the command the user is looking at, not
-    /// the shell that started it. Zero when there is nothing to report.
-    var foregroundPID: pid_t {
-        guard let surface else { return 0 }
-        return pid_t(ghostty_surface_foreground_pid(surface))
-    }
+    // What is running in the terminal is the session's business now: this
+    // surface's own child is the attach process, so libghostty's foreground
+    // pid and quit check would only ever describe that.
 
     func setMouseShape(_ shape: ghostty_action_mouse_shape_e) {
         cursor = Self.cursor(for: shape)
@@ -701,6 +699,44 @@ final class GhosttySurfaceView: NSView, NSTextInputClient {
         } else if clearIfNeeded {
             ghostty_surface_preedit(surface, nil, 0)
         }
+    }
+
+    // MARK: - Dropping files and text
+
+    /// Tabs dragged from the tab bar carry only their own type, so they pass
+    /// straight through to the split container behind us.
+    static let dropTypes: Set<NSPasteboard.PasteboardType> = [.string, .fileURL, .URL]
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard let types = sender.draggingPasteboard.types,
+              !Set(types).isDisjoint(with: Self.dropTypes)
+        else { return [] }
+        return .copy
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let pasteboard = sender.draggingPasteboard
+
+        // Same order and escaping as Ghostty: links as-is but escaped, files
+        // as escaped paths, and plain text untouched since it may be a command.
+        let content: String?
+        if let url = pasteboard.string(forType: .URL) {
+            content = Ghostty.Shell.escape(url)
+        } else if let urls = pasteboard.readObjects(forClasses: [NSURL.self]) as? [URL],
+                  !urls.isEmpty {
+            content = urls.map { Ghostty.Shell.escape($0.path) }.joined(separator: " ")
+        } else {
+            content = pasteboard.string(forType: .string)
+        }
+
+        guard let content, !content.isEmpty else { return false }
+
+        // Outside keyDown this goes to libghostty as a paste, which is how
+        // Claude Code spots a dropped image path and attaches the image.
+        DispatchQueue.main.async { [weak self] in
+            self?.insertText(content, replacementRange: NSRange(location: 0, length: 0))
+        }
+        return true
     }
 
     // MARK: - Menu actions

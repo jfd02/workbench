@@ -1,27 +1,39 @@
 import AppKit
+import TabTermKit
 
-/// An in-process smoke test, run with `TabTerm --self-test`.
+/// An in-process smoke test, run with `Workbench --self-test`.
 ///
 /// It calls the same methods the buttons and menu items call, so behavior can
 /// be verified without synthesizing mouse or keyboard events. That means it
 /// never moves the cursor and never steals focus from whatever you're doing.
-/// A tab being dragged over a pane, without a real mouse involved.
+/// Something being dragged over a view, without a real mouse involved.
 ///
 /// AppKit hands the destination an `NSDraggingInfo`; this is the smallest one
-/// that carries a tab id and a location.
+/// that carries a pasteboard and a location.
 private final class FakeDrag: NSObject, NSDraggingInfo {
     let draggingLocation: NSPoint
     let draggingPasteboard: NSPasteboard
 
-    init(tabID: UUID, location: NSPoint) {
+    init(location: NSPoint = .zero, contents: (NSPasteboard) -> Void) {
         draggingLocation = location
         draggingPasteboard = NSPasteboard(name: NSPasteboard.Name("tabterm-selftest"))
         draggingPasteboard.clearContents()
-        draggingPasteboard.setString(
-            tabID.uuidString,
-            forType: SplitContainerView.tabPasteboardType
-        )
+        contents(draggingPasteboard)
         super.init()
+    }
+
+    /// A tab from the tab bar.
+    convenience init(tabID: UUID, location: NSPoint) {
+        self.init(location: location) {
+            $0.setString(tabID.uuidString, forType: SplitContainerView.tabPasteboardType)
+        }
+    }
+
+    /// Files from Finder, or a screenshot's floating thumbnail.
+    convenience init(files: [URL]) {
+        self.init { pasteboard in
+            pasteboard.writeObjects(files as [NSURL])
+        }
     }
 
     var draggingDestinationWindow: NSWindow? { nil }
@@ -51,7 +63,14 @@ private final class FakeDrag: NSObject, NSDraggingInfo {
 }
 
 /// Pane content that holds nothing, so the icon and title plumbing can be
-/// driven without a real terminal or web view behind it.
+/// driven without a real terminal behind it.
+private extension NSView {
+    /// The middle of the view in window coordinates, where a click on it lands.
+    var centerInWindow: NSPoint {
+        convert(NSPoint(x: bounds.midX, y: bounds.midY), to: nil)
+    }
+}
+
 private final class StubContent: TabContent {
     /// Stands in for content with something at stake, which a real terminal
     /// can't be made into deterministically.
@@ -62,7 +81,6 @@ private final class StubContent: TabContent {
     }
 
     let view = NSView()
-    let kind: TabKind = .terminal
     var title = "Stub"
     var icon: NSImage?
 
@@ -89,19 +107,15 @@ enum SelfTest {
         CommandLine.arguments.contains("--self-test")
     }
 
-    /// A small solid-colour PNG, standing in for a downloaded favicon.
-    static func swatchPNG(size: Int = 64) -> Data {
+    /// A small solid-colour image, standing in for an icon that content
+    /// reports about whatever it is running.
+    static func swatch(size: Int = 64) -> NSImage {
         let image = NSImage(size: NSSize(width: size, height: size))
         image.lockFocus()
         NSColor.systemPink.setFill()
         NSRect(x: 0, y: 0, width: size, height: size).fill()
         image.unlockFocus()
-
-        guard let tiff = image.tiffRepresentation,
-              let rep = NSBitmapImageRep(data: tiff),
-              let png = rep.representation(using: .png, properties: [:])
-        else { return Data() }
-        return png
+        return image
     }
 
     private static var checks = 0
@@ -142,10 +156,46 @@ enum SelfTest {
     }
 
     /// Gather every view of a kind in a tree, for checking what's on screen.
+    /// The sidebar row titled `title`, if one is on screen.
+    private static func sidebarRow(
+        _ title: String,
+        in controller: MainWindowController
+    ) -> SidebarCellView? {
+        var cells: [SidebarCellView] = []
+        collectViews(in: controller.window?.contentView, into: &cells)
+        return cells.first { $0.textField?.stringValue == title }
+    }
+
     private static func collectViews<T: NSView>(in root: NSView?, into found: inout [T]) {
         guard let root else { return }
         if let match = root as? T { found.append(match) }
         for subview in root.subviews { collectViews(in: subview, into: &found) }
+    }
+
+    /// The strip's button for one tab.
+    private static func tabButton(for id: UUID?, in controller: MainWindowController) -> TabButtonView? {
+        guard let id else { return nil }
+        var buttons: [TabButtonView] = []
+        collectViews(in: controller.window?.contentView, into: &buttons)
+        return buttons.first { $0.tabID == id }
+    }
+
+    /// A click of a mouse button past left and right, at a point in window
+    /// coordinates. `NSEvent`'s own constructor always reports button 0, so
+    /// this goes through CGEvent, which takes a screen point with a flipped
+    /// origin — and hands back an event whose `locationInWindow` reads as the
+    /// unflipped point, which is what the view being clicked converts.
+    private static func otherMouseUp(button: Int, at point: NSPoint) -> NSEvent? {
+        guard let primary = NSScreen.screens.first,
+              let button = CGMouseButton(rawValue: UInt32(button)),
+              let event = CGEvent(
+                  mouseEventSource: nil,
+                  mouseType: .otherMouseUp,
+                  mouseCursorPosition: CGPoint(x: point.x, y: primary.frame.maxY - point.y),
+                  mouseButton: button
+              )
+        else { return nil }
+        return NSEvent(cgEvent: event)
     }
 
     private static func run(steps: [Step], then finish: @escaping () -> Void) {
@@ -183,14 +233,13 @@ enum SelfTest {
     }
 
     static func start(_ controller: MainWindowController) {
-        print("TabTerm self-test")
+        print("Workbench self-test")
 
-        let example = URL(string: "https://example.com/docs")!
-        var localPage: URL?
         var temporaryRepo: String?
         var scratchRepository: Repository?
         var featureWorktree: Worktree?
         var mainWorktreeID: Int64?
+        var externalWorktreeID: Int64?
 
         // Agent status runs against a throwaway directory, never the one the
         // running app watches.
@@ -201,8 +250,33 @@ enum SelfTest {
             )
         let agents = AgentActivityStore(directory: agentDirectory)
         var envTerminal: TerminalTabContent?
+        var nativeTerminal: TerminalTabContent?
         var envProbe: URL?
+        var dropSurface: GhosttySurfaceView?
+        var dropReady: URL?
+        var dropProbe: URL?
+        var dropFiles: [URL] = []
+        var dropExpected = ""
         var litAgent: String?
+        var resumeTerminal: TerminalTabContent?
+        var resumeProbe: URL?
+        var resumeRunner: URL?
+        var restoreProbe: URL?
+        var restoreRunner: URL?
+        var phoneTerminal: TerminalTabContent?
+        var phones: [TestPhone] = []
+        var phonePort: UInt16 = 0
+        var pairingCode = ""
+        var macSize = TerminalSize(cols: 0, rows: 0)
+        var phoneRepository: Repository?
+
+        // The hook script is generated Swift-side as a string, so the only way
+        // to know the escaping survives into bash is to run the real thing.
+        let hookDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(
+                "tabterm-hooks-\(ProcessInfo.processInfo.processIdentifier)",
+                isDirectory: true
+            )
 
         /// Leave an event the way the hook does: written elsewhere, then moved
         /// into place, so the watcher sees the same thing it sees in the wild.
@@ -215,20 +289,67 @@ enum SelfTest {
             )
         }
 
-        func dialog() -> NewTabDialog? {
-            controller.window?.attachedSheet?.contentViewController as? NewTabDialog
+        /// An executable stand-in for an agent: running it writes `mark` to a
+        /// file, so a command typed into a terminal can be observed landing.
+        ///
+        /// Its argv has the shape a real agent's does — the path, then the path
+        /// again — and it ignores the resume flags appended after it.
+        func makeRunner(mark: String) -> (runner: URL, probe: URL) {
+            let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            let probe = directory.appendingPathComponent("tabterm-\(mark)-\(UUID().uuidString)")
+            let runner = directory
+                .appendingPathComponent("tabterm-runner-\(UUID().uuidString).sh")
+            try? "#!/bin/sh\nprintf %s \(mark) > \(probe.path)\n"
+                .write(to: runner, atomically: true, encoding: .utf8)
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: runner.path)
+            return (runner, probe)
         }
 
-        // The add-site sheet hangs off the new-tab sheet, not the window.
-        func addSiteSheet() -> AddSiteDialog? {
-            dialog()?.view.window?.attachedSheet?.contentViewController as? AddSiteDialog
+        /// Run the installed hook script the way an agent runs it, and hand back
+        /// whatever it left in the state directory.
+        ///
+        /// `onStdin` is the difference between the two: Claude Code pipes the
+        /// payload in, while codex has passed it as an argument.
+        func runHook(
+            event: String,
+            agent: String,
+            payload: String,
+            onStdin: Bool = true,
+            from agentID: String
+        ) -> [String: Any]? {
+            try? FileManager.default.createDirectory(
+                at: hookDirectory, withIntermediateDirectories: true)
+            let script = hookDirectory.appendingPathComponent(AgentHooks.scriptName)
+            try? AgentHooks.script.write(to: script, atomically: true, encoding: .utf8)
+
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = [script.path, event, agent] + (onStdin ? [] : [payload])
+            process.environment = [
+                "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
+                "TABTERM_AGENT_ID": agentID,
+                "TABTERM_AGENT_DIR": hookDirectory.path,
+            ]
+            let input = Pipe()
+            process.standardInput = input
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+
+            try? process.run()
+            if onStdin { input.fileHandleForWriting.write(Data(payload.utf8)) }
+            try? input.fileHandleForWriting.close()
+            process.waitUntilExit()
+
+            let file = hookDirectory.appendingPathComponent("\(agentID).json")
+            guard let data = try? Data(contentsOf: file) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         }
 
         run(steps: [
             .act("storage", {
                 // main.swift redirected us to a temp file for this run.
                 expect(AppDatabase.shared.openError == nil, "database opened cleanly")
-                expectEqual(PinnedSites.all.count, 0, "temp database starts empty")
 
                 AppState.set("hello", forKey: "selftest")
                 expectEqual(AppState.string(forKey: "selftest"), "hello", "app state round-trips")
@@ -236,16 +357,11 @@ enum SelfTest {
                 expectEqual(AppState.string(forKey: "selftest"), "world", "app state overwrites")
                 AppState.set(nil, forKey: "selftest")
                 expect(AppState.string(forKey: "selftest") == nil, "app state deletes")
-
-                expect(
-                    UserDefaults.standard.data(forKey: "pinnedSites") == nil,
-                    "nothing of ours left in UserDefaults"
-                )
             }),
 
             .act("startup state", {
                 expectEqual(controller.tabSnapshot.count, 1, "one tab at launch")
-                expectEqual(controller.tabSnapshot.first?.kind, .terminal, "it is a terminal")
+                expect(controller.selectedTabContent is TerminalTabContent, "it is a terminal")
                 expect(GhosttyApp.shared.app != nil, "libghostty app created")
                 expect(GhosttyApp.shared.startupError == nil, "no libghostty startup error")
             }),
@@ -273,119 +389,27 @@ enum SelfTest {
             }),
 
             .act("tabs draw the icon their content reports", {
-                let icon = FaviconStore.decode(swatchPNG())
-                expect(icon != nil, "a stand-in favicon to hand around")
+                let icon = swatch()
 
                 let stub = StubContent()
                 let tab = Tab(content: stub)
                 var refreshes = 0
                 tab.onTitleChange = { refreshes += 1 }
 
-                expect(tab.icon == nil, "a tab with no icon falls back to its kind")
+                expect(tab.icon == nil, "a tab with no icon falls back to the terminal symbol")
                 stub.emit(icon)
                 expect(tab.icon === icon, "the tab takes the icon from its focused pane")
                 expectEqual(refreshes, 1, "and asks the tab bar to redraw once")
 
-                let button = TabButtonView(tabID: tab.id, kind: .browser, title: "Example")
+                let button = TabButtonView(tabID: tab.id, title: "Example")
                 let symbol = button.iconImageForTesting
-                expect(symbol != nil, "a tab button starts with its kind's symbol")
+                expect(symbol != nil, "a tab button starts with the terminal symbol")
                 button.icon = icon
                 expect(button.iconImageForTesting === icon, "an icon replaces the symbol")
                 button.icon = nil
                 expect(button.iconImageForTesting !== icon, "and clearing it puts the symbol back")
 
                 tab.closeAll()
-            }),
-
-            .act("url normalization", {
-                expectEqual(
-                    BrowserTabContent.normalizeURL("example.com")?.absoluteString,
-                    "https://example.com",
-                    "bare host gets https"
-                )
-                expectEqual(
-                    BrowserTabContent.normalizeURL("https://a.dev/x")?.absoluteString,
-                    "https://a.dev/x",
-                    "full url passes through"
-                )
-                expectEqual(
-                    BrowserTabContent.normalizeURL("localhost:3000")?.absoluteString,
-                    "https://localhost:3000",
-                    "localhost with port"
-                )
-                expect(
-                    BrowserTabContent.normalizeURL("how tall is everest")?
-                        .host?.contains("duckduckgo") == true,
-                    "plain text becomes a search"
-                )
-
-                // Saving a site takes the stricter reading: no searches.
-                expectEqual(
-                    BrowserTabContent.address("figma.com")?.absoluteString,
-                    "https://figma.com",
-                    "an address is still an address"
-                )
-                expect(
-                    BrowserTabContent.address("how tall is everest") == nil,
-                    "but plain text is refused rather than searched"
-                )
-                expectEqual(
-                    PinnedSite.suggestedTitle(for: URL(string: "https://www.figma.com/files")!),
-                    "Figma",
-                    "an unnamed site is named after its host"
-                )
-            }),
-
-            .act("site icons are cached", {
-                FaviconStore.resetForTesting()
-                let site = URL(string: "https://icons.example/page")!
-                expect(FaviconStore.cached(for: site) == nil, "nothing cached to begin with")
-
-                expect(
-                    FaviconStore.storeForTesting(swatchPNG(), for: site),
-                    "an icon normalizes and stores"
-                )
-                guard let icon = FaviconStore.cached(for: site) else {
-                    return expect(false, "and comes back out of the database")
-                }
-                expect(true, "and comes back out of the database")
-                expectEqual(icon.size, NSSize(width: 16, height: 16), "sized in points to draw at")
-                expect(!icon.isTemplate, "and not a template, so its colors survive")
-
-                // Same host, different page: one icon covers the site.
-                expect(
-                    FaviconStore.cached(for: URL(string: "https://icons.example/other")!) != nil,
-                    "another page on the host uses it too"
-                )
-                expect(
-                    FaviconStore.cached(for: URL(string: "https://other.example/")!) == nil,
-                    "a different host does not"
-                )
-
-                // With the network off this must answer rather than hang.
-                var answered = false
-                FaviconStore.icon(for: URL(string: "https://nowhere.example/")!) { image in
-                    answered = true
-                    expect(image == nil, "an unknown host with no network resolves to nothing")
-                }
-                expect(answered, "and answers straight away")
-            }),
-
-            .act("icons declared by a page are found", {
-                let html = Data("""
-                <html><head>
-                <link rel="stylesheet" href="/style.css">
-                <link rel="shortcut icon" href="/small.ico">
-                <link rel="apple-touch-icon" href="https://cdn.example/touch.png">
-                </head><body></body></html>
-                """.utf8)
-                let links = FaviconStore.iconLinks(
-                    inHTML: html, base: URL(string: "https://site.example/page")!)
-
-                expectEqual(links.map(\.absoluteString), [
-                    "https://site.example/small.ico",
-                    "https://cdn.example/touch.png",
-                ], "icon links are read, relative ones resolved, stylesheets ignored")
             }),
 
             .act("what a terminal is running", {
@@ -410,78 +434,265 @@ enum SelfTest {
                     !ForegroundProcess.isClaude(commandLine: ["/usr/bin/vim", "vim", "claude.md"]),
                     "and neither is an editor holding a file named after it"
                 )
-            }),
 
-            .act("pinned sites store", {
-                expect(!PinnedSites.isPinned(example), "not pinned initially")
-                PinnedSites.add(title: "Example Docs", url: example)
-                expectEqual(PinnedSites.all.count, 1, "one pin after add")
-                expect(PinnedSites.isPinned(example), "isPinned true after add")
-
-                // Same page with tracking junk should not create a second pin.
-                let tracked = URL(string: "https://example.com/docs/?utm_source=x")!
-                expect(PinnedSites.isPinned(tracked), "matches ignoring query and trailing slash")
-                PinnedSites.add(title: "Renamed", url: example)
-                expectEqual(PinnedSites.all.count, 1, "re-adding updates instead of duplicating")
-                expectEqual(PinnedSites.all.first?.title, "Renamed", "title updated")
-
-                PinnedSites.remove(example)
-                expect(!PinnedSites.isPinned(example), "unpinned after remove")
-                expectEqual(PinnedSites.all.count, 0, "store empty again")
-            }),
-
-            .act("pin ordering survives a round trip", {
-                let a = URL(string: "https://a.example/1")!
-                let b = URL(string: "https://b.example/2")!
-                let c = URL(string: "https://c.example/3")!
-                PinnedSites.add(title: "A", url: a)
-                PinnedSites.add(title: "B", url: b)
-                PinnedSites.add(title: "C", url: c)
-                expectEqual(PinnedSites.all.map(\.title), ["A", "B", "C"], "insertion order kept")
-
-                PinnedSites.remove(b)
-                expectEqual(PinnedSites.all.map(\.title), ["A", "C"], "order kept after a removal")
-                PinnedSites.replaceAll(with: [])
-                expectEqual(PinnedSites.all.count, 0, "cleared")
-            }),
-
-            .act("browser tab creation", {
-                controller.addTab(.browser, url: example)
-                expectEqual(controller.tabSnapshot.count, 2, "two tabs after adding browser")
-                expectEqual(controller.tabSnapshot.last?.kind, .browser, "second tab is a browser")
-                expectEqual(
-                    controller.selectedTabID,
-                    controller.tabSnapshot.last?.id,
-                    "new tab is selected"
+                expect(
+                    ForegroundProcess.agent(commandLine: ["/Users/x/.local/bin/codex"]) == .codex,
+                    "the codex binary is recognized too"
                 )
-                controller.closeTab(controller.tabSnapshot.last!.id)
+                expect(
+                    ForegroundProcess.agent(commandLine: [
+                        "/Users/x/.local/bin/codex-code-mode-host",
+                    ]) == nil,
+                    "but not another binary its name is only the start of"
+                )
+                expect(
+                    ForegroundProcess.agent(commandLine: ["/usr/bin/vim", "vim", "codex.md"]) == nil,
+                    "nor an editor holding a file named after it"
+                )
             }),
 
-            .act("pin button on a real loaded page", {
-                // A local file, so this doesn't depend on the network.
-                let path = NSTemporaryDirectory() + "tabterm-selftest.html"
-                try? "<title>Pin Me</title><h1>hi</h1>".write(
-                    toFile: path, atomically: true, encoding: .utf8)
-                localPage = URL(fileURLWithPath: path)
-                controller.addTab(.browser, url: localPage)
+            .act("a resumed session keeps the flags it was started under", {
+                // The shape the kernel actually reports, checked against a live
+                // `claude` process: the executable path, then argv — which
+                // repeats it — then the flags. A shell alias is long gone by
+                // this point, so replaying argv is the only way to know that
+                // this session was started in permission-skipping mode.
+                let yolo = [
+                    "/Users/x/.claude/local/node_modules/.bin/claude",
+                    "/Users/x/.claude/local/node_modules/.bin/claude",
+                    "--dangerously-skip-permissions",
+                ]
+                let claude = AgentSession(agent: .claude, sessionID: "abc-123", commandLine: yolo)
+                expectEqual(
+                    claude?.resumeCommand,
+                    "/Users/x/.claude/local/node_modules/.bin/claude"
+                        + " --dangerously-skip-permissions --resume abc-123",
+                    "the recorded command line comes back with a resume flag"
+                )
+
+                let node = AgentSession(
+                    agent: .claude,
+                    sessionID: "n1",
+                    commandLine: [
+                        "/opt/homebrew/bin/node", "node",
+                        "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                    ]
+                )
+                expectEqual(
+                    node?.resumeCommand,
+                    "/opt/homebrew/bin/node"
+                        + " /opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+                        + " --resume n1",
+                    "an npm install replays as the node command it is"
+                )
+
+                // A pane restored twice must not accumulate resume flags.
+                let again = AgentSession(
+                    agent: .claude,
+                    sessionID: "new",
+                    commandLine: ["/bin/claude", "/bin/claude", "--resume", "old", "--model", "opus"]
+                )
+                expectEqual(
+                    again?.resumeCommand,
+                    "/bin/claude --model opus --resume new",
+                    "an earlier resume is replaced, not appended to"
+                )
+                expectEqual(
+                    AgentSession(
+                        agent: .claude,
+                        sessionID: "new",
+                        commandLine: ["/bin/claude", "/bin/claude", "-c"]
+                    )?.resumeCommand,
+                    "/bin/claude --resume new",
+                    "and so is a bare --continue"
+                )
+
+                expectEqual(
+                    AgentSession(
+                        agent: .codex,
+                        sessionID: "c1",
+                        commandLine: ["/bin/codex", "/bin/codex", "--search"]
+                    )?.resumeCommand,
+                    "/bin/codex resume --search c1",
+                    "codex resumes through a subcommand, carrying its flags across"
+                )
+                expectEqual(
+                    AgentSession(
+                        agent: .codex,
+                        sessionID: "c2",
+                        commandLine: ["/bin/codex", "/bin/codex", "resume", "--last", "--search"]
+                    )?.resumeCommand,
+                    "/bin/codex resume --search c2",
+                    "a session that was itself resumed doesn't stack subcommands"
+                )
+                expectEqual(
+                    AgentSession(
+                        agent: .codex,
+                        sessionID: "c4",
+                        commandLine: ["/bin/codex", "/bin/codex", "-m", "gpt-5.1-codex"]
+                    )?.resumeCommand,
+                    "/bin/codex resume -m gpt-5.1-codex c4",
+                    "and a flag's value travels with it"
+                )
+                expect(
+                    AgentSession(
+                        agent: .codex,
+                        sessionID: "c3",
+                        commandLine: ["/bin/codex", "/bin/codex", "exec", "do a thing"]
+                    ) == nil,
+                    "a one-shot `codex exec` is not a session to come back to"
+                )
+
+                expectEqual(
+                    AgentSession(
+                        agent: .claude,
+                        sessionID: "m1",
+                        commandLine: ["/bin/claude", "/bin/claude", "--model", "opus"]
+                    )?.resumeCommand,
+                    "/bin/claude --model opus --resume m1",
+                    "a flag that takes a value keeps it"
+                )
+
+                expectEqual(
+                    AgentSession(
+                        agent: .claude,
+                        sessionID: "q1",
+                        commandLine: ["/opt/My Tools/claude"]
+                    )?.resumeCommand,
+                    "'/opt/My Tools/claude' --resume q1",
+                    "a path with a space in it is quoted"
+                )
+                expect(
+                    AgentSession(agent: .claude, sessionID: "", commandLine: ["/bin/claude"]) == nil,
+                    "a session with no id is nothing to resume"
+                )
             }),
 
-            .waitUntil("local page finishes loading", {
-                (controller.selectedTabContent as? BrowserTabContent)?.currentURL != nil
+            .act("a session started with a prompt is not resumed at all", {
+                // The prompt was an instruction, and it has already been given.
+                // Sending it again on every restart — in whatever permission
+                // mode the pane was in — is worse than not resuming, so a
+                // command line carrying one is left as a plain shell.
+                expect(
+                    AgentSession(
+                        agent: .claude,
+                        sessionID: "p1",
+                        commandLine: [
+                            "/bin/claude", "/bin/claude",
+                            "--dangerously-skip-permissions", "fix the tests",
+                        ]
+                    ) == nil,
+                    "a prompt after a flag is still a prompt"
+                )
+                expect(
+                    AgentSession(
+                        agent: .claude,
+                        sessionID: "p2",
+                        commandLine: ["/bin/claude", "/bin/claude", "fix the tests"]
+                    ) == nil,
+                    "and so is one on its own"
+                )
+                expect(
+                    AgentSession(
+                        agent: .codex,
+                        sessionID: "p3",
+                        commandLine: ["/bin/codex", "/bin/codex", "fix the tests"]
+                    ) == nil,
+                    "codex is read the same way"
+                )
+
+                // The rule that separates the two: a value belongs to the flag
+                // in front of it. A flag we don't know is assumed not to take
+                // one, so its value reads as a prompt and the pane is left
+                // alone — wrong in the safe direction.
+                expect(
+                    AgentSession(
+                        agent: .claude,
+                        sessionID: "p4",
+                        commandLine: ["/bin/claude", "/bin/claude", "--future-flag", "value"]
+                    ) == nil,
+                    "an unknown flag's value is treated as a prompt, not replayed"
+                )
+
+                // The one bare word that isn't a prompt: the agent naming
+                // itself, for an install that runs through a runtime.
+                expectEqual(
+                    AgentSession(
+                        agent: .claude,
+                        sessionID: "p5",
+                        commandLine: [
+                            "/opt/homebrew/bin/node", "node", "--enable-source-maps",
+                            "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                        ]
+                    )?.resumeCommand,
+                    "/opt/homebrew/bin/node --enable-source-maps"
+                        + " /opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+                        + " --resume p5",
+                    "which is kept wherever it sits"
+                )
             }),
 
-            .act("toggling the pin button pins the live page", {
-                guard let browser = controller.selectedTabContent as? BrowserTabContent,
-                      let url = browser.currentURL
-                else { return expect(false, "browser tab has a loaded URL") }
+            .act("a session whose transcript is gone is left alone", {
+                let transcript = URL(fileURLWithPath: NSTemporaryDirectory())
+                    .appendingPathComponent("tabterm-transcript-\(UUID().uuidString).jsonl")
+                FileManager.default.createFile(atPath: transcript.path, contents: Data())
 
-                expect(!PinnedSites.isPinned(url), "page starts unpinned")
-                browser.togglePin()
-                expect(PinnedSites.isPinned(url), "pin button pinned the page")
-                browser.togglePin()
-                expect(!PinnedSites.isPinned(url), "pin button unpinned it again")
+                let live = AgentSession(
+                    agent: .claude,
+                    sessionID: "t1",
+                    commandLine: ["/bin/claude"],
+                    transcript: transcript.path
+                )
+                expect(live?.isResumable == true, "a session whose transcript is there resumes")
 
-                controller.closeTab(controller.tabSnapshot.last!.id)
+                try? FileManager.default.removeItem(at: transcript)
+                expect(
+                    live?.isResumable == false,
+                    "one deleted since the window closed does not"
+                )
+                expect(live?.resumeCommand == nil, "so nothing is typed for it")
+
+                expect(
+                    AgentSession(
+                        agent: .claude, sessionID: "t2", commandLine: ["/bin/claude"]
+                    )?.isResumable == true,
+                    "a session the hook never named a transcript for is still tried"
+                )
+            }),
+
+            .act("saved layouts carry the session, old ones decode without it", {
+                let session = AgentSession(
+                    agent: .codex,
+                    sessionID: "s-1",
+                    commandLine: ["/bin/codex", "/bin/codex", "--yolo"],
+                    transcript: "/tmp/rollout.jsonl"
+                )
+                let layout = SavedLayout.split(
+                    stacked: true,
+                    ratio: 0.4,
+                    first: .pane(directory: "/tmp", agent: session, focused: true),
+                    second: .pane(directory: nil, agent: nil, focused: false)
+                )
+                guard let json = layout.json else {
+                    return expect(false, "a layout with a session encodes")
+                }
+                expectEqual(SavedLayout(json: json), layout, "and round-trips unchanged")
+                expectEqual(
+                    SavedLayout(json: json)?.leaves.first?.agent?.sessionID, "s-1",
+                    "with the session id on the right leaf")
+
+                // Rows written before any of this existed, and before that by a
+                // build that still had browser tabs. Both have to keep their
+                // shape rather than collapsing to one pane.
+                let old = #"{"split":{"stacked":true,"ratio":0.4,"#
+                    + #""first":{"pane":{"directory":"/tmp","focused":true}},"#
+                    + #""second":{"pane":{"kind":"browser","url":"https://x","focused":false}}}}"#
+                guard let decoded = SavedLayout(json: old) else {
+                    return expect(false, "a layout saved before agents were restored still decodes")
+                }
+                expectEqual(decoded.leaves.count, 2, "keeping both panes")
+                expect(decoded.leaves.first?.agent == nil, "with no session to resume")
+                expectEqual(decoded.leaves.first?.directory, "/tmp", "and the directory it had")
             }),
 
             .act("workspaces are per worktree", {
@@ -506,7 +717,7 @@ enum SelfTest {
                     // may have no git identity configured.
                     try GitService.run([
                         "-c", "user.email=selftest@tabterm.local",
-                        "-c", "user.name=TabTerm Self Test",
+                        "-c", "user.name=Workbench Self Test",
                         "commit", "-m", "initial",
                     ], in: repoPath)
                 } catch {
@@ -561,13 +772,7 @@ enum SelfTest {
                     return expect(false, "main worktree has an id")
                 }
 
-                // The repository row carries its own + for adding a worktree.
                 controller.reloadSidebar()
-                let plus = findView(in: controller.window?.contentView) { view in
-                    view.accessibilityIdentifier() == "newWorktreeButton"
-                        && !view.isHidden
-                }
-                expect(plus != nil, "the repository row shows a + for new worktrees")
 
                 // Home has whatever tabs the earlier steps left it.
                 let homeTabs = controller.tabSnapshot.count
@@ -575,7 +780,7 @@ enum SelfTest {
                 expectEqual(controller.currentWorkspaceKey, .worktree(id), "switched workspace")
                 expectEqual(controller.tabSnapshot.count, 1, "new workspace opens one terminal")
 
-                controller.addTab(.terminal)
+                controller.addTab()
                 expectEqual(controller.tabSnapshot.count, 2, "added a tab in the worktree")
 
                 controller.selectWorkspace(.home)
@@ -602,6 +807,29 @@ enum SelfTest {
                 featureWorktree = other
                 mainWorktreeID = id
                 controller.selectWorkspace(.home)
+            }),
+
+            .act("changes and CI panels follow the workspace", {
+                guard let id = featureWorktree?.id,
+                      let split = controller.window?.contentViewController as? NSSplitViewController,
+                      let inspector = split.splitViewItems.last,
+                      let review = inspector.viewController as? ReviewViewController
+                else { return expect(false, "the review panel is installed") }
+                controller.selectWorkspace(.worktree(id))
+                controller.toggleChangesPanel()
+                controller.window?.contentView?.layoutSubtreeIfNeeded()
+                expect(!inspector.isCollapsed, "Changes opens the inspector")
+                expect(!review.displaysCI, "Changes shows the file list")
+                expect(review.view.bounds.width >= 299, "the inspector has usable width")
+                controller.toggleCIPanel()
+                expect(!inspector.isCollapsed && review.displaysCI, "CI switches the open inspector")
+                controller.toggleCIPanel()
+                expect(inspector.isCollapsed, "pressing CI again closes the inspector")
+                controller.toggleChangesPanel()
+                controller.selectWorkspace(.home)
+                expect(inspector.isCollapsed, "Home hides repository review")
+                let changes = findView(in: controller.window?.contentView, where: { $0.accessibilityIdentifier() == "showChanges" }) as? NSButton
+                expect(changes?.isEnabled == false, "Home disables the Changes button")
             }),
 
             .act("branch state shows in the sidebar", {
@@ -663,6 +891,122 @@ enum SelfTest {
                 PullRequestService.resetForTesting()
             }),
 
+            // Anything the sidebar asked git earlier has to land first, or it
+            // could overwrite what the next step sets up.
+            .waitUntil("git has answered for every worktree", {
+                !WorktreeActivity.isCheckingForTesting
+            }),
+
+            .act("a worktree whose code sits unchanged goes stale", {
+                guard let feature = featureWorktree
+                else { return expect(false, "the scratch repo is still set up") }
+
+                // The branch's last commit, and the worktree itself, from well back.
+                let longAgo = Date().addingTimeInterval(
+                    -Double(WorktreeActivity.staleAfterDays + 3) * 86_400 - 3_600)
+                let commit = Process()
+                commit.executableURL = GitService.executableURL
+                commit.arguments = [
+                    "-c", "user.email=selftest@tabterm.local",
+                    "-c", "user.name=Workbench Self Test",
+                    "commit", "--allow-empty", "-m", "old work",
+                ]
+                commit.currentDirectoryURL = URL(fileURLWithPath: feature.path)
+                var environment = ProcessInfo.processInfo.environment
+                let stamp = "@\(Int(longAgo.timeIntervalSince1970)) +0000"
+                environment["GIT_AUTHOR_DATE"] = stamp
+                environment["GIT_COMMITTER_DATE"] = stamp
+                commit.environment = environment
+                commit.standardOutput = FileHandle.nullDevice
+                commit.standardError = FileHandle.nullDevice
+                try? commit.run()
+                commit.waitUntilExit()
+                expectEqual(commit.terminationStatus, 0, "made a commit dated well back")
+                try? FileManager.default.setAttributes(
+                    [.creationDate: longAgo], ofItemAtPath: feature.path)
+
+                WorktreeActivity.resetForTesting()
+                controller.selectWorkspace(.home)
+                controller.reloadSidebar()
+            }),
+
+            .waitUntil("an untouched worktree counts its days", {
+                guard let feature = featureWorktree else { return false }
+                return sidebarRow(feature.displayName, in: controller)?.staleDays
+                    == WorktreeActivity.staleAfterDays + 3
+            }),
+
+            .act("and greys out, even when highlighted", {
+                guard let feature = featureWorktree, let featureID = feature.id
+                else { return expect(false, "the scratch repo is still set up") }
+
+                expectEqual(
+                    sidebarRow(feature.displayName, in: controller)?.iconTintForTesting,
+                    NSColor.secondaryLabelColor,
+                    "its icon goes grey"
+                )
+                expect(
+                    sidebarRow("main", in: controller)?.staleDays == nil,
+                    "the main checkout carries no count"
+                )
+
+                // Looking at it isn't a code change.
+                controller.selectWorkspace(.worktree(featureID))
+                controller.reloadSidebar()
+                expect(
+                    sidebarRow(feature.displayName, in: controller)?.staleDays != nil,
+                    "opening it doesn't freshen it"
+                )
+
+                // The row on screen is the highlighted one, drawn by the row
+                // view that keeps it blue without keyboard focus.
+                var rowViews: [SidebarRowView] = []
+                collectViews(in: controller.window?.contentView, into: &rowViews)
+                let selected = rowViews.filter(\.isSelected)
+                expectEqual(selected.count, 1, "exactly one sidebar row is highlighted")
+                expect(
+                    selected.first?.subviews.contains {
+                        ($0 as? SidebarCellView)?.textField?.stringValue == feature.displayName
+                    } == true,
+                    "and it is the workspace on screen"
+                )
+                expectEqual(
+                    selected.first?.interiorBackgroundStyle, .normal,
+                    "its text keeps its colours on the pale tint"
+                )
+
+                // Rebuilding the tree on its own, as a worktree added or
+                // removed on disk does, keeps the highlight where it was.
+                controller.sidebarPanel.reload()
+                rowViews = []
+                collectViews(in: controller.window?.contentView, into: &rowViews)
+                expect(
+                    rowViews.filter(\.isSelected).first?.subviews.contains {
+                        ($0 as? SidebarCellView)?.textField?.stringValue == feature.displayName
+                    } == true,
+                    "the highlight survives the sidebar rebuilding itself"
+                )
+
+                // An edit that hasn't been committed yet still counts.
+                FileManager.default.createFile(
+                    atPath: feature.path + "/notes.txt", contents: Data("wip".utf8))
+                WorktreeActivity.resetForTesting()
+                controller.reloadSidebar()
+            }),
+
+            .waitUntil("an uncommitted edit freshens it", {
+                guard let feature = featureWorktree else { return false }
+                return !WorktreeActivity.isCheckingForTesting
+                    && sidebarRow(feature.displayName, in: controller)?.staleDays == nil
+            }),
+
+            .act("put the worktree back as it was", {
+                guard let feature = featureWorktree else { return }
+                // Left behind, it would stop git removing the worktree below.
+                try? FileManager.default.removeItem(atPath: feature.path + "/notes.txt")
+                controller.selectWorkspace(.home)
+            }),
+
             .act("a worktree can be removed from its context menu", {
                 guard let repository = scratchRepository,
                       let feature = featureWorktree,
@@ -716,6 +1060,164 @@ enum SelfTest {
 
             .waitUntil("confirmation dismissed", { controller.window?.attachedSheet == nil }),
 
+            .act("a worktree removed outside Workbench", {
+                guard let repository = scratchRepository else {
+                    return expect(false, "the scratch repo is still set up")
+                }
+                let path = GitService.defaultWorktreePath(
+                    repositoryPath: repository.path, branch: "external")
+                do {
+                    try GitService.addWorktree(
+                        repositoryPath: repository.path, path: path,
+                        branch: "external", createBranch: true)
+                    try RepositoryStore.refreshWorktrees(of: repository)
+                } catch {
+                    return expect(false, "git worktree add: \(error.localizedDescription)")
+                }
+                controller.reloadSidebar()
+                guard let external = RepositoryStore.worktrees(ofRepository: repository.id ?? -1)
+                    .first(where: { $0.path == path }), let id = external.id
+                else { return expect(false, "the external worktree was picked up") }
+
+                // As if an agent in this worktree's terminal removed it.
+                controller.selectWorkspace(.worktree(id))
+                do {
+                    try GitService.run(["worktree", "remove", path], in: repository.path)
+                } catch {
+                    return expect(false, "git worktree remove: \(error.localizedDescription)")
+                }
+                externalWorktreeID = id
+            }),
+
+            .waitUntil("the sidebar notices", {
+                guard let id = externalWorktreeID else { return true }
+                return RepositoryStore.worktree(id: id) == nil
+            }),
+
+            .act("the terminal that removed it stays open", {
+                guard let id = externalWorktreeID else { return }
+                expect(RepositoryStore.worktree(id: id) == nil, "its row is gone")
+                expectEqual(
+                    controller.currentWorkspaceKey, .worktree(id),
+                    "but the workspace on screen wasn't closed under the user"
+                )
+                controller.selectWorkspace(.home)
+                expect(
+                    !controller.openWorkspaceKeysForTesting.contains(.worktree(id)),
+                    "and it's forgotten once the user moves away"
+                )
+            }),
+
+            .act("removing a worktree git already forgot", {
+                guard let repository = scratchRepository else {
+                    return expect(false, "the scratch repo is still set up")
+                }
+                let path = GitService.defaultWorktreePath(
+                    repositoryPath: repository.path, branch: "stale")
+                do {
+                    try GitService.addWorktree(
+                        repositoryPath: repository.path, path: path,
+                        branch: "stale", createBranch: true)
+                    try RepositoryStore.refreshWorktrees(of: repository)
+                } catch {
+                    return expect(false, "git worktree add: \(error.localizedDescription)")
+                }
+                guard let stale = RepositoryStore.worktrees(ofRepository: repository.id ?? -1)
+                    .first(where: { $0.path == path })
+                else { return expect(false, "the stale worktree was picked up") }
+
+                // Removed behind the sidebar's back, before it has refreshed.
+                _ = try? GitService.run(["worktree", "remove", path], in: repository.path)
+                let error = controller.sidebarPanel.performRemoveWorktree(stale, in: repository)
+                expect(error == nil, "removing it again isn't an error")
+                expect(
+                    !RepositoryStore.worktrees(ofRepository: repository.id ?? -1)
+                        .contains { $0.path == path },
+                    "and its row is gone"
+                )
+            }),
+
+            .act("remote branches can be checked out", {
+                guard let repository = scratchRepository else {
+                    return expect(false, "the scratch repo is still set up")
+                }
+                // A clone of the scratch repo stands in for GitHub: it gets a
+                // branch the scratch repo has never seen, then becomes origin.
+                let upstream = repository.path + "-upstream"
+                try? FileManager.default.removeItem(atPath: upstream)
+                do {
+                    try GitService.run(["clone", "--quiet", repository.path, upstream], in: NSTemporaryDirectory())
+                    try GitService.run(["branch", "remote-only"], in: upstream)
+                    // "external" is local and unused; put it on the remote too.
+                    try GitService.run(["branch", "external", "origin/external"], in: upstream)
+                    try GitService.run(["remote", "add", "origin", upstream], in: repository.path)
+                    try GitService.fetchAll(repositoryPath: repository.path)
+                } catch {
+                    return expect(false, "setting up a remote: \(error.localizedDescription)")
+                }
+
+                let choices = GitService.branchChoices(for: repository.path)
+                expect(
+                    choices.contains(BranchChoice(name: "remote-only", remoteRef: "origin/remote-only")),
+                    "a branch only on the remote is offered"
+                )
+                expectEqual(
+                    choices.first { $0.name == "remote-only" }?.remoteName, "origin",
+                    "labelled with its remote"
+                )
+                expect(
+                    !choices.contains { $0.name == "main" },
+                    "a remote branch whose local one is checked out isn't offered"
+                )
+                expect(
+                    choices.filter { $0.name == "external" } == [BranchChoice(name: "external", remoteRef: nil)],
+                    "a branch on both sides shows once, as the local one"
+                )
+                if let firstRemote = choices.firstIndex(where: { $0.remoteRef != nil }) {
+                    expect(
+                        choices[firstRemote...].allSatisfy { $0.remoteRef != nil },
+                        "local branches are listed before remote ones"
+                    )
+                }
+
+                // The sheet lists them, and searching narrows the list.
+                let dialog = NewWorktreeDialog(repository: repository) { _ in }
+                var tables: [NSTableView] = []
+                collectViews(in: dialog.view, into: &tables)
+                var searches: [NSSearchField] = []
+                collectViews(in: dialog.view, into: &searches)
+                guard let table = tables.first, let search = searches.first else {
+                    return expect(false, "the sheet has a search field and a branch list")
+                }
+                expectEqual(table.numberOfRows, choices.count, "the sheet lists every choice")
+                search.stringValue = "remote only"
+                NotificationCenter.default.post(
+                    name: NSControl.textDidChangeNotification, object: search)
+                expectEqual(table.numberOfRows, 1, "searching by words narrows the list")
+                expectEqual(table.selectedRow, 0, "and the match is selected, ready for Return")
+
+                let path = GitService.defaultWorktreePath(
+                    repositoryPath: repository.path, branch: "remote-only")
+                do {
+                    try GitService.addWorktree(
+                        repositoryPath: repository.path, path: path, branch: "remote-only",
+                        createBranch: true, startPoint: "origin/remote-only", track: true)
+                    let upstreamRef = try GitService.run(
+                        ["rev-parse", "--abbrev-ref", "remote-only@{upstream}"], in: repository.path)
+                    expectEqual(
+                        upstreamRef.trimmingCharacters(in: .whitespacesAndNewlines),
+                        "origin/remote-only",
+                        "checking one out makes a local branch tracking it"
+                    )
+                    try GitService.run(["worktree", "remove", path], in: repository.path)
+                    try GitService.run(["remote", "remove", "origin"], in: repository.path)
+                } catch {
+                    expect(false, "git worktree add from a remote: \(error.localizedDescription)")
+                }
+                try? FileManager.default.removeItem(atPath: upstream)
+                try? RepositoryStore.refreshWorktrees(of: repository)
+            }),
+
             .act("confirming removes it for real", {
                 guard let repository = scratchRepository, let feature = featureWorktree else {
                     return expect(false, "the scratch repo is still set up")
@@ -723,6 +1225,16 @@ enum SelfTest {
                 expect(
                     FileManager.default.fileExists(atPath: feature.path),
                     "cancelling left the worktree alone"
+                )
+
+                // The repository asks for a command once a worktree is gone. It
+                // writes what it was told into the directory it runs in.
+                let config = [
+                    "worktreeRemoved": "printf '%s' \"$TABTERM_REMOVED_WORKTREES\" > removed-worktrees.txt",
+                ]
+                FileManager.default.createFile(
+                    atPath: repository.path + "/" + RemovedWorktreeCommand.fileName,
+                    contents: try? JSONSerialization.data(withJSONObject: config)
                 )
 
                 let error = controller.sidebarPanel.performRemoveWorktree(feature, in: repository)
@@ -754,12 +1266,19 @@ enum SelfTest {
                 )
             }),
 
+            .waitUntil("the repository's command ran in its main checkout, told which worktree went", {
+                guard let repository = scratchRepository, let feature = featureWorktree else { return false }
+                let told = try? String(
+                    contentsOfFile: repository.path + "/removed-worktrees.txt", encoding: .utf8)
+                return told == feature.path
+            }),
+
             .act("a split layout survives a restore", {
                 // Build a tab with three panes: one split right, then that half
                 // split down, with an off-centre divider.
                 controller.selectWorkspace(.home)
                 for tab in controller.tabSnapshot { controller.closeTab(tab.id) }
-                controller.addTab(.terminal)
+                controller.addTab()
 
                 guard let tab = controller.selectedTab, let root = tab.focusedPaneID else {
                     return expect(false, "a tab to split")
@@ -822,7 +1341,7 @@ enum SelfTest {
 
                 // Hand the later steps a plain single-pane tab again.
                 for entry in controller.tabSnapshot { controller.closeTab(entry.id) }
-                controller.addTab(.terminal)
+                controller.addTab()
                 expectEqual(controller.tabSnapshot.count, 1, "workspace reset for later steps")
             }),
 
@@ -893,9 +1412,9 @@ enum SelfTest {
                 // Three tabs, then jump to the third the way the menu does.
                 controller.selectWorkspace(.home)
                 for entry in controller.tabSnapshot { controller.closeTab(entry.id) }
-                controller.addTab(.terminal)
-                controller.addTab(.terminal)
-                controller.addTab(.terminal)
+                controller.addTab()
+                controller.addTab()
+                controller.addTab()
                 expectEqual(controller.tabSnapshot.count, 3, "three tabs open")
 
                 let third = controller.tabSnapshot[2].id
@@ -927,7 +1446,7 @@ enum SelfTest {
                 )
 
                 // Adding or closing a tab does change the order, so it rebuilds.
-                controller.addTab(.terminal)
+                controller.addTab()
                 expect(
                     bar.rebuildCountForTesting > before,
                     "but a new tab still rebuilds the strip"
@@ -945,10 +1464,10 @@ enum SelfTest {
                 }
                 controller.selectWorkspace(.home)
                 for entry in controller.tabSnapshot { controller.closeTab(entry.id) }
-                controller.addTab(.terminal)
+                controller.addTab()
 
                 let widthBefore = window.frame.width
-                for _ in 1...12 { controller.addTab(.terminal) }
+                for _ in 1...12 { controller.addTab() }
                 expectEqual(controller.tabSnapshot.count, 13, "thirteen tabs open")
                 expectEqual(
                     window.frame.width, widthBefore,
@@ -977,8 +1496,8 @@ enum SelfTest {
             .act("tabs advertise their ⌘-number", {
                 controller.selectWorkspace(.home)
                 for entry in controller.tabSnapshot { controller.closeTab(entry.id) }
-                controller.addTab(.terminal)
-                for _ in 1...10 { controller.addTab(.terminal) }
+                controller.addTab()
+                for _ in 1...10 { controller.addTab() }
                 expectEqual(controller.tabSnapshot.count, 11, "eleven tabs open")
 
                 var buttons: [TabButtonView] = []
@@ -1122,65 +1641,21 @@ enum SelfTest {
                 )
             }),
 
-            .act("open the new-tab dialog", {
-                PinnedSites.add(title: "Example Docs", url: example)
-                controller.presentNewTabDialog()
-            }),
-
-            .waitUntil("new-tab dialog presented as a sheet", { dialog() != nil }),
-
-            .act("dialog contents", {
-                guard let dialog = dialog() else { return }
+            .act("a new tab opens without asking anything", {
+                let before = controller.tabSnapshot.count
+                controller.addTab()
+                expectEqual(controller.tabSnapshot.count, before + 1, "the tab is open")
+                expect(controller.window?.attachedSheet == nil, "and no sheet was put up")
                 expectEqual(
-                    dialog.rowTitles,
-                    ["Terminal", "Web Browser", "Example Docs", "Add Site…"],
-                    "rows are terminal, browser, pins, then the way to add one"
+                    controller.selectedTabID,
+                    controller.tabSnapshot.last?.id,
+                    "and it is selected"
                 )
-                dialog.presentAddSiteForTesting()
-            }),
-
-            .waitUntil("add-site sheet opens on top", { addSiteSheet() != nil }),
-
-            .act("adding a site", {
-                guard let sheet = addSiteSheet() else { return }
-
-                expect(
-                    !sheet.addForTesting(address: "somewhere nice"),
-                    "text that isn't an address is refused"
-                )
-                expect(addSiteSheet() != nil, "and the sheet stays open to fix it")
-
-                expect(sheet.addForTesting(address: "figma.com"), "a bare host is accepted")
-            }),
-
-            .waitUntil("add-site sheet closes", { addSiteSheet() == nil }),
-
-            .act("the added site is in the list", {
-                expectEqual(
-                    PinnedSites.all.map(\.title), ["Example Docs", "Figma"],
-                    "it was saved, named after its host"
-                )
-                expectEqual(
-                    PinnedSites.all.last?.url.absoluteString, "https://figma.com",
-                    "with https filled in"
-                )
-                expectEqual(
-                    dialog()?.rowTitles,
-                    ["Terminal", "Web Browser", "Example Docs", "Figma", "Add Site…"],
-                    "and the launcher lists it without being reopened"
-                )
-                dialog()?.cancelForTesting()
-            }),
-
-            .waitUntil("dialog dismissed", { controller.window?.attachedSheet == nil }),
-
-            .act("tidy up the pins", {
-                PinnedSites.replaceAll(with: [])
-                expectEqual(PinnedSites.all.count, 0, "pins cleared")
+                controller.closeTab(controller.tabSnapshot.last!.id)
             }),
 
             .act("open a tab to close", {
-                controller.addTab(.terminal)
+                controller.addTab()
                 expectEqual(controller.tabSnapshot.count, 2, "second tab open")
             }),
 
@@ -1207,7 +1682,7 @@ enum SelfTest {
             .act("but a tab with something running still asks", {
                 // Split in a stub that reports work in progress — a real
                 // terminal can't be made busy deterministically here.
-                let tab = controller.addTab(.terminal)
+                let tab = controller.addTab()
                 guard let paneID = tab.focusedPaneID else {
                     return expect(false, "the new tab has a pane")
                 }
@@ -1221,6 +1696,14 @@ enum SelfTest {
                 controller.window?.attachedSheet != nil
             }),
 
+            .act("Return is on the close button", {
+                expectEqual(
+                    controller.window?.attachedSheet?.defaultButtonCell?.title,
+                    "Close Tab",
+                    "so Return confirms the close without reaching for the mouse"
+                )
+            }),
+
             .act("cancelling keeps the tab", {
                 expectEqual(controller.tabSnapshot.count, 2, "tab still open while asking")
                 if let sheet = controller.window?.attachedSheet {
@@ -1232,6 +1715,62 @@ enum SelfTest {
 
             .act("cancel left the tab alone", {
                 expectEqual(controller.tabSnapshot.count, 2, "cancel left the tab open")
+            }),
+
+            .act("a side button leaves the tab alone", {
+                guard let button = tabButton(for: controller.tabSnapshot.last?.id, in: controller) else {
+                    return expect(false, "the tab has a button in the strip")
+                }
+                guard let event = otherMouseUp(button: 3, at: button.centerInWindow) else {
+                    return expect(false, "a click to send")
+                }
+
+                button.otherMouseUp(with: event)
+                expect(
+                    controller.window?.attachedSheet == nil,
+                    "the back button on a mouse doesn't close tabs"
+                )
+            }),
+
+            .act("middle-click off the tab leaves it alone too", {
+                guard let button = tabButton(for: controller.tabSnapshot.last?.id, in: controller) else {
+                    return expect(false, "the tab has a button in the strip")
+                }
+                guard let event = otherMouseUp(button: 2, at: NSPoint(x: -50, y: -50)) else {
+                    return expect(false, "a click to send")
+                }
+
+                button.otherMouseUp(with: event)
+                expect(
+                    controller.window?.attachedSheet == nil,
+                    "releasing away from the tab cancels the click"
+                )
+            }),
+
+            .act("middle-click on the tab asks the same way ⌘W does", {
+                guard let button = tabButton(for: controller.tabSnapshot.last?.id, in: controller) else {
+                    return expect(false, "the tab has a button in the strip")
+                }
+                guard let event = otherMouseUp(button: 2, at: button.centerInWindow) else {
+                    return expect(false, "a click to send")
+                }
+
+                button.otherMouseUp(with: event)
+            }),
+
+            .waitUntil("middle-click puts up the confirmation", {
+                controller.window?.attachedSheet != nil
+            }),
+
+            .act("and cancelling it keeps the tab", {
+                expectEqual(controller.tabSnapshot.count, 2, "tab still open while asking")
+                if let sheet = controller.window?.attachedSheet {
+                    controller.window?.endSheet(sheet, returnCode: .alertSecondButtonReturn)
+                }
+            }),
+
+            .waitUntil("middle-click confirmation dismissed", {
+                controller.window?.attachedSheet == nil
             }),
 
             .act("process-exit close skips confirmation", {
@@ -1253,6 +1792,86 @@ enum SelfTest {
 
                 controller.splitFocusedPane(.down)
                 expectEqual(tab.paneCount, 3, "⌘⇧D splits the focused pane again")
+            }),
+
+            .waitUntil("the split's shell is running before it moves", {
+                (controller.selectedTabContent as? TerminalTabContent)?.foregroundPID ?? 0 > 0
+            }),
+
+            .act("moving a live split to a new tab", {
+                guard let source = controller.selectedTab,
+                      let pane = source.focusedPane,
+                      let terminal = pane.content as? TerminalTabContent
+                else { return expect(false, "a focused terminal to move") }
+                let session = terminal.session
+                let process = terminal.foregroundPID
+                let count = source.paneCount
+                let outerRatio = source.root.ratio
+
+                guard let delegate = NSApp.delegate as? AppDelegate,
+                      let menu = NSApp.mainMenu?.items.compactMap(\.submenu)
+                        .first(where: { $0.title == "View" }),
+                      let item = menu.items.first(where: { $0.title == "Move Split to New Tab" })
+                else { return expect(false, "the move command is in the View menu") }
+                expect(delegate.validateMenuItem(item), "the move command is enabled for a split")
+                expectEqual(item.keyEquivalent, "t", "the move shortcut uses T")
+                expectEqual(item.keyEquivalentModifierMask, [.command, .shift],
+                            "the move shortcut uses Command-Shift")
+                menu.performActionForItem(at: menu.index(of: item))
+                expect(!delegate.validateMenuItem(item), "the move command is disabled for a lone pane")
+
+                guard let destination = controller.selectedTab else {
+                    return expect(false, "the new tab is selected")
+                }
+                expect(destination.id != source.id, "the split has its own tab")
+                expectEqual(controller.tabSnapshot.map(\.id), [source.id, destination.id],
+                            "the new tab sits directly after the source")
+                expectEqual(source.paneCount, count - 1, "only the moved split left the source")
+                expectEqual(source.root.ratio, outerRatio, "the outer divider stays put")
+                expect(source.pane(for: pane.id) == nil, "the source relinquished the pane")
+                expect(source.focusedPane != nil, "the source retains a focused pane")
+                expect(destination.focusedPane === pane, "the pane and its identity survive")
+                expect(destination.focusedPane?.content === terminal, "the live terminal view survives")
+                expect(terminal.session === session, "the shell session survives")
+                expectEqual(terminal.foregroundPID, process, "the foreground process is unchanged")
+                expectEqual(destination.paneCount, 1, "the new tab contains just the moved split")
+                expect(controller.window?.attachedSheet == nil, "moving asks no close confirmation")
+
+                controller.currentWorkspace.persist()
+                let saved = SavedTabStore.tabs(forWorktree: controller.currentWorkspaceKey.worktreeId)
+                expectEqual(saved.map { $0.savedLayout.leaves.count }, [count - 1, 1],
+                            "both tab layouts are saved")
+                expect(saved.last?.isSelected == true, "the new tab's selection is saved")
+            }),
+
+            .waitUntil("the moved terminal receives keyboard focus", {
+                guard let view = controller.window?.firstResponder as? NSView,
+                      let content = controller.selectedTabContent else { return false }
+                return view === content.view || view.isDescendant(of: content.view)
+            }),
+
+            .act("moved terminal callbacks belong to its new tab", {
+                guard let destination = controller.selectedTab,
+                      let pane = destination.focusedPane,
+                      let terminal = pane.content as? TerminalTabContent,
+                      let source = controller.currentWorkspace.tabs.first,
+                      let target = source.focusedPane
+                else { return expect(false, "both tabs survived the move") }
+
+                controller.moveFocusedPaneToNewTab()
+                expectEqual(controller.tabSnapshot.count, 2, "a lone pane stays in its existing tab")
+                expectEqual(controller.selectedTabID, destination.id, "a lone pane keeps its selection")
+
+                terminal.onSplitRequest?(.right)
+                expectEqual(destination.paneCount, 2, "split requests reach the new tab")
+                if let added = destination.focusedPane, added.id != pane.id {
+                    added.content.onRequestClose?(false)
+                }
+                expectEqual(destination.paneCount, 1, "close requests reach the new tab")
+
+                controller.moveTab(destination.id, into: source.id,
+                                   target: SplitDropTarget(paneID: target.id, direction: .down))
+                expectEqual(source.paneCount, 3, "the moved pane can be merged back")
             }),
 
             .act("drop zones follow the pointer", {
@@ -1282,7 +1901,7 @@ enum SelfTest {
 
                 // A fresh single-pane tab, so there is no doubt which pane a
                 // point is over.
-                let target = controller.addTab(.terminal)
+                let target = controller.addTab()
                 controller.window?.layoutIfNeeded()
 
                 guard let container = target.view as? SplitContainerView,
@@ -1337,7 +1956,8 @@ enum SelfTest {
                 }
                 let panesBefore = target.paneCount
 
-                let dragged = controller.addTab(.browser, url: example)
+                let dragged = controller.addTab()
+                let draggedContent = dragged.focusedPane?.content
                 expectEqual(controller.tabSnapshot.count, 2, "two tabs before the drop")
 
                 // The same call the drop handler makes.
@@ -1350,8 +1970,9 @@ enum SelfTest {
                 expectEqual(controller.tabSnapshot.count, 1, "the dragged tab left the strip")
                 expectEqual(target.paneCount, panesBefore + 1, "and became a pane")
                 expect(
-                    target.panes.contains { $0.content is BrowserTabContent },
-                    "the browser came with it"
+                    draggedContent != nil
+                        && target.panes.contains { $0.content === draggedContent },
+                    "carrying its own terminal"
                 )
                 expectEqual(controller.selectedTabID, target.id, "the receiving tab is selected")
             }),
@@ -1369,11 +1990,15 @@ enum SelfTest {
             }),
 
             .act("hook events become agent states", {
-                func state(_ event: String) -> AgentState? {
+                func state(_ event: String) -> AgentStatus? {
                     AgentActivityStore.state(forEvent: event)
                 }
                 expectEqual(state("UserPromptSubmit"), .working, "a prompt starts a turn")
                 expectEqual(state("PostToolUse"), .working, "a finished tool call is progress")
+                expectEqual(state("PreToolUse"), .working, "starting a tool repairs a missed start")
+                expectEqual(state("Interrupt"), .idle, "interrupting Codex clears working without a completion")
+                expectEqual(state("ElicitationResult"), .working, "answering a question resumes work")
+                expectEqual(state("IdlePrompt"), .idle, "an idle reminder is not a permission request")
                 expectEqual(state("PermissionRequest"), .blocked, "a permission prompt blocks")
                 expectEqual(state("Notification"), .blocked, "so does a notification")
                 expectEqual(state("Stop"), .finished, "the turn ending wants the user")
@@ -1384,19 +2009,19 @@ enum SelfTest {
                 // Every event we register has to map to something, or the hook
                 // would fire into the void.
                 expect(
-                    ClaudeHooks.registrations.allSatisfy { state($0.event) != nil },
+                    AgentHooks.registrations.allSatisfy { state($0.event) != nil },
                     "every registered event maps to a state"
                 )
             }),
 
             .act("a worktree shows its most demanding pane", {
                 expectEqual(
-                    [AgentState.working, .idle, .blocked].max(), .blocked,
+                    [AgentStatus.working, .idle, .blocked].max(), .blocked,
                     "a blocked agent outranks a working one")
                 expectEqual(
-                    [AgentState.working, .finished].max(), .finished,
+                    [AgentStatus.working, .finished].max(), .finished,
                     "and a finished turn outranks work still going on")
-                expectEqual([AgentState]().max() ?? .idle, .idle, "no terminals, no dot")
+                expectEqual([AgentStatus]().max() ?? .idle, .idle, "no terminals, no dot")
             }),
 
             .act("reported events reach the store", {
@@ -1432,6 +2057,177 @@ enum SelfTest {
                     "and a new turn lights it again")
             }),
 
+            .act("a new completion survives a coalesced working event", {
+                report("Stop", from: "alpha")
+                agents.reload()
+                agents.acknowledge(["alpha"])
+                agents.reload()
+                expectEqual(agents.state(ofAgent: "alpha"), .idle, "rereading a seen turn keeps it seen")
+                report("Stop", from: "alpha")
+                agents.reload()
+                expectEqual(agents.state(ofAgent: "alpha"), .finished, "a later turn needs attention again")
+            }),
+
+            .act("completion sound plays once per new turn and respects mute", {
+                var plays = 0
+                var enabled = true
+                let sound = AgentCompletionSound(isEnabled: { enabled }, play: { plays += 1 })
+                var event = AgentReport(state: .working, at: Date(timeIntervalSince1970: 1))
+                sound.update(["alpha": event])
+                event.state = .blocked
+                sound.update(["alpha": event])
+                expectEqual(plays, 0, "work and permission prompts are not completion sounds")
+                event.state = .finished
+                sound.update(["alpha": event])
+                sound.update(["alpha": event])
+                event.transcript = "/tmp/transcript"
+                sound.update(["alpha": event])
+                expectEqual(plays, 1, "rereads and metadata changes do not replay a completion")
+                event.at = Date(timeIntervalSince1970: 2)
+                sound.update(["alpha": event])
+                expectEqual(plays, 2, "a later completion chimes even if the working event was coalesced")
+                enabled = false
+                event.at = Date(timeIntervalSince1970: 3)
+                sound.update(["alpha": event])
+                enabled = true
+                sound.update(["alpha": event])
+                expectEqual(plays, 2, "unmuting does not replay old completions")
+                event.at = Date(timeIntervalSince1970: 4)
+                sound.update(["alpha": event, "beta": event])
+                expectEqual(plays, 3, "simultaneous completions share one sound")
+                sound.update([:])
+                expectEqual(plays, 3, "removing a terminal is silent")
+                expect(NSSound(named: "Glass") != nil, "the system completion sound is available")
+
+                let saved = AppState.string(forKey: "agentCompletionSound")
+                defer { AppState.set(saved, forKey: "agentCompletionSound") }
+                AppState.set(nil, forKey: "agentCompletionSound")
+                expect(AgentCompletionSound.isEnabled, "sound defaults to enabled")
+                AgentCompletionSound.isEnabled = false
+                expect(!AgentCompletionSound.isEnabled, "the mute setting persists")
+            }),
+
+            .act("sound selection and custom imports persist safely", {
+                let keys = ["agentCompletionSound", "agentCompletionSoundName", "agentCompletionSoundCustomFile", "agentCompletionSoundCustomName"]
+                let saved = keys.map { AppState.string(forKey: $0) }
+                var imported: String?
+                let source = agentDirectory.appendingPathComponent("custom sound.aiff")
+                let invalid = agentDirectory.appendingPathComponent("not audio.wav")
+                defer {
+                    if let imported { try? FileManager.default.removeItem(atPath: imported) }
+                    try? FileManager.default.removeItem(at: source)
+                    try? FileManager.default.removeItem(at: invalid)
+                    for (key, value) in zip(keys, saved) { AppState.set(value, forKey: key) }
+                }
+                AgentCompletionSound.select("Ping")
+                expectEqual(AgentCompletionSound.selectedSound, "Ping", "the chosen system sound persists")
+                expect(AgentCompletionSound.isEnabled, "choosing a sound unmutes it")
+                AgentCompletionSound.select("not-a-preset")
+                expectEqual(AgentCompletionSound.selectedSound, "Ping", "an unknown preset cannot replace the selection")
+                do {
+                    try FileManager.default.copyItem(atPath: "/System/Library/Sounds/Glass.aiff", toPath: source.path)
+                    try AgentCompletionSound.importCustomSound(from: source)
+                    imported = AppState.string(forKey: "agentCompletionSoundCustomFile")
+                    try FileManager.default.removeItem(at: source)
+                    expectEqual(AgentCompletionSound.selectedSound, "custom", "the custom sound is selected")
+                    expectEqual(AgentCompletionSound.customName, "custom sound.aiff", "the menu remembers its readable name")
+                    expect(imported.map { FileManager.default.fileExists(atPath: $0) } == true, "moving the original does not lose the imported sound")
+                    try Data("not audio".utf8).write(to: invalid)
+                    do {
+                        try AgentCompletionSound.importCustomSound(from: invalid)
+                        expect(false, "invalid audio is rejected")
+                    } catch { expect(true, "invalid audio is rejected") }
+                    expectEqual(AppState.string(forKey: "agentCompletionSoundCustomFile"), imported, "a failed import keeps the previous sound")
+                } catch { expect(false, "custom sound import: \(error)") }
+                let menu = NSApp.mainMenu?.items.first?.submenu?.items.first { $0.title == "Agent Completion Sound" }?.submenu
+                expect(menu?.items.contains { $0.title == "Choose Custom Sound…" } == true, "the app menu exposes the custom picker")
+                expect(menu?.items.contains { $0.title == "Preview Sound" } == true, "and an explicit preview")
+                expect(menu?.items.contains { $0.title == "None" } == true, "and muting")
+            }),
+
+            .act("native activity recovers stale status without fabricating completions", {
+                report("UserPromptSubmit", from: "native-ended")
+                report("PermissionRequest", from: "native-blocked")
+                report("UserPromptSubmit", from: "native-new-turn")
+                report("UserPromptSubmit", from: "native-late-stop")
+                agents.reload()
+                agents.receiveNativeState(.idle, forAgent: "native-ended")
+                agents.receiveNativeState(.idle, forAgent: "native-blocked")
+                agents.receiveNativeState(.idle, forAgent: "native-new-turn")
+                agents.receiveNativeState(.working, forAgent: "native-new-turn")
+                agents.receiveNativeState(.idle, forAgent: "native-late-stop")
+                report("Stop", from: "native-late-stop")
+                agents.reload()
+                expectEqual(agents.state(ofAgent: "native-ended"), .working, "a late Stop gets time to arrive")
+            }),
+
+            .waitUntil("native idle settles after the grace period", {
+                agents.state(ofAgent: "native-ended") == .idle
+            }),
+
+            .act("recovery protects prompts, newer work, and unread completions", {
+                expectEqual(agents.state(ofAgent: "native-blocked"), .blocked, "a permission request is not cleared by settlement")
+                expectEqual(agents.state(ofAgent: "native-new-turn"), .working, "new native work cancels pending settlement")
+                expectEqual(agents.state(ofAgent: "native-late-stop"), .finished, "a late real Stop retains its completion")
+                expectEqual(agents.reports["native-ended"]?.state, .working, "recovery does not invent a Stop for sound or phone notifications")
+                report("PostToolUse", from: "another-agent")
+                agents.reload()
+                expectEqual(agents.state(ofAgent: "native-ended"), .idle, "an unrelated hook cannot resurrect the stale state file")
+                report("PreToolUse", from: "native-ended")
+                agents.reload()
+                expectEqual(agents.state(ofAgent: "native-ended"), .working, "a new hook supersedes the recovery")
+                agents.agentReturnedToShell("native-ended")
+                agents.agentReturnedToShell("native-blocked")
+                agents.agentReturnedToShell("native-late-stop")
+                expectEqual(agents.state(ofAgent: "native-ended"), .idle, "returning to the shell clears stale working")
+                expectEqual(agents.state(ofAgent: "native-blocked"), .idle, "an exited agent cannot still need permission")
+                expectEqual(agents.state(ofAgent: "native-late-stop"), .finished, "process exit keeps unread completion")
+                report("IdlePrompt", from: "native-late-stop")
+                agents.reload()
+                expectEqual(agents.state(ofAgent: "native-late-stop"), .finished, "an idle reminder keeps unread completion too")
+            }),
+
+            .act("Codex recovery accepts explicit lifecycle records only", {
+                let start = #"{"type":"event_msg","timestamp":"2026-10-27T10:00:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#
+                let stop = #"{"type":"event_msg","timestamp":"2026-10-27T10:00:10Z","payload":{"type":"task_complete","turn_id":"turn-1"}}"#
+                let aborted = stop.replacingOccurrences(of: "task_complete", with: "turn_aborted")
+                let work = CodexTranscriptActivity.latest(in: Data((start + "\n").utf8))
+                let done = CodexTranscriptActivity.latest(in: Data((start + "\n" + stop + "\n").utf8))
+                expectEqual(work?.state, .working, "task_started supplies positive evidence of work")
+                expectEqual(done?.state, .idle, "task_complete repairs a missed Stop silently")
+                expectEqual(CodexTranscriptActivity.latest(in: Data((aborted + "\n").utf8))?.state, .idle, "an abort also clears working")
+                expect(CodexTranscriptActivity.latest(in: Data(stop.utf8)) == nil, "a partially written final line is ignored")
+                expect(CodexTranscriptActivity.latest(in: Data("unknown format\n".utf8)) == nil, "unknown formats cannot change status")
+                guard let work, let done else { return }
+                var hook = AgentReport(state: .working, at: work.at, agent: "codex", turnID: "turn-1")
+                expect(done.follows(hook), "completion is tied to the expected turn")
+                hook.turnID = "turn-2"
+                expect(!done.follows(hook), "an older turn cannot settle a newer one")
+                hook.state = .blocked
+                expect(!work.follows(hook), "task_started in the same second cannot undo a permission prompt")
+            }),
+
+            .act("native activity crosses a real pty", {
+                nativeTerminal = TerminalTabContent(command:
+                    "sh -c 'printf \"\\033]7501;state=working:app=claude-code\\007\"; sleep 1; "
+                    + "printf \"\\033]7501;state=idle:app=claude-code\\007\"; sleep 5'")
+            }),
+
+            .waitUntil("the pty's native report lights working", {
+                guard let nativeTerminal else { return false }
+                return AgentActivityStore.shared.state(ofAgent: nativeTerminal.agentID) == .working
+            }),
+
+            .waitUntil("and its idle report repairs the missing Stop", {
+                guard let nativeTerminal else { return false }
+                return AgentActivityStore.shared.state(ofAgent: nativeTerminal.agentID) == .idle
+            }),
+
+            .act("done with the native reporter", {
+                nativeTerminal?.close()
+                nativeTerminal = nil
+            }),
+
             .waitUntil("the directory watch notices a report", {
                 // Written without calling reload: this is the path the hook
                 // actually takes.
@@ -1450,11 +2246,15 @@ enum SelfTest {
             }),
 
             .act("hook entries merge into settings.json", {
+                guard let target = AgentHooks.targets.first(where: { $0.agent == .claude }) else {
+                    return expect(false, "claude is one of the agents we register with")
+                }
+
                 // A path with a space in it, because ours has one.
                 let script = "/Users/someone/Library/Application Support/TabTerm/hooks/"
-                    + ClaudeHooks.scriptName
-                let command = ClaudeHooks.command(scriptPath: script, event: "Stop")
-                expect(command.contains("'\(script)' Stop"), "the script path is quoted")
+                    + AgentHooks.scriptName
+                let command = AgentHooks.command(scriptPath: script, event: "Stop", agent: .claude)
+                expect(command.contains("'\(script)' Stop claude"), "the script path is quoted")
 
                 let existing: [String: Any] = [
                     "model": "opus",
@@ -1463,40 +2263,29 @@ enum SelfTest {
                     ],
                 ]
 
-                let installed = ClaudeHooks.settings(byAdding: existing, scriptPath: script)
+                let installed = AgentHooks.settings(
+                    byAdding: existing, scriptPath: script, target: target)
                 expectEqual(installed["model"] as? String, "opus", "other settings survive")
 
                 let hooks = installed["hooks"] as? [String: Any] ?? [:]
                 expect(
-                    ClaudeHooks.registrations.allSatisfy { hooks[$0.event] != nil },
+                    AgentHooks.registrations(for: target).allSatisfy { hooks[$0.event] != nil },
                     "every event we watch is registered"
                 )
                 expectEqual(
                     (hooks["Stop"] as? [[String: Any]])?.count, 2,
                     "ours sits beside the user's own Stop hook")
 
-                let again = ClaudeHooks.settings(byAdding: installed, scriptPath: script)
+                let again = AgentHooks.settings(
+                    byAdding: installed, scriptPath: script, target: target)
                 expectEqual(
                     ((again["hooks"] as? [String: Any])?["Stop"] as? [[String: Any]])?.count, 2,
                     "installing twice doesn't stack up duplicates")
 
-                let removed = ClaudeHooks.settings(byRemoving: again, scriptPath: script)
-                expectEqual(removed["model"] as? String, "opus", "removal leaves the rest alone")
-                let stop = (removed["hooks"] as? [String: Any])?["Stop"] as? [[String: Any]]
-                expectEqual(stop?.count, 1, "the user's Stop hook is kept")
+                let stop = (again["hooks"] as? [String: Any])?["Stop"] as? [[String: Any]]
                 expectEqual(
                     ((stop?.first?["hooks"] as? [[String: Any]])?.first?["command"] as? String),
-                    "say done", "exactly as it was")
-                expect(
-                    (removed["hooks"] as? [String: Any])?["PermissionRequest"] == nil,
-                    "and events only we used are gone entirely"
-                )
-
-                // A file that was ours alone comes back empty, not with a
-                // leftover "hooks": {}.
-                let ours = ClaudeHooks.settings(byAdding: [:], scriptPath: script)
-                let bare = ClaudeHooks.settings(byRemoving: ours, scriptPath: script)
-                expect(bare["hooks"] == nil, "nothing of ours is left behind")
+                    "say done", "the user's Stop command survives reinstall unchanged")
 
                 // An entry the user added their own command to keeps theirs.
                 let shared: [String: Any] = [
@@ -1509,11 +2298,181 @@ enum SelfTest {
                         ]]
                     ]
                 ]
-                let kept = ClaudeHooks.settings(byRemoving: shared, scriptPath: script)
+                let kept = AgentHooks.settings(byAdding: shared, scriptPath: script, target: target)
                 let entry = ((kept["hooks"] as? [String: Any])?["Stop"] as? [[String: Any]])?.first
                 expectEqual(
                     (entry?["hooks"] as? [[String: Any]])?.count, 1,
                     "a shared entry keeps the user's command")
+            }),
+
+            .act("the hook script reports which session it is in", {
+                try? FileManager.default.removeItem(at: hookDirectory)
+
+                let payload = #"{"session_id":"11111111-2222-3333-4444-555555555555","#
+                    + #""transcript_path":"/tmp/tabterm-transcript.jsonl","#
+                    + #""hook_event_name":"Stop","cwd":"/tmp"}"#
+
+                guard let written = runHook(
+                    event: "Stop", agent: "claude", payload: payload, from: "hooked"
+                ) else {
+                    return expect(false, "the hook script wrote a state file")
+                }
+                expect(true, "the hook script wrote a state file")
+                expectEqual(written["event"] as? String, "Stop", "naming the event")
+                expectEqual(written["agent"] as? String, "claude", "and the agent that sent it")
+                expectEqual(
+                    written["session"] as? String, "11111111-2222-3333-4444-555555555555",
+                    "and the session id out of the payload")
+                expectEqual(
+                    written["transcript"] as? String, "/tmp/tabterm-transcript.jsonl",
+                    "and where that session is written down")
+
+                // A payload with no session in it at all still has to leave a
+                // readable file behind, or the dot stops working.
+                let bare = runHook(
+                    event: "UserPromptSubmit", agent: "claude",
+                    payload: #"{"hook_event_name":"UserPromptSubmit"}"#, from: "bare")
+                expectEqual(bare?["event"] as? String, "UserPromptSubmit", "a payload with no id")
+                expectEqual(bare?["session"] as? String, "", "leaves the session empty")
+            }),
+
+            .act("a subagent's tool calls are not the terminal's status", {
+                let payload = #"{"session_id":"sub","agent_id":"agent_1","#
+                    + #""hook_event_name":"PostToolUse"}"#
+                expect(
+                    runHook(event: "PostToolUse", agent: "claude", payload: payload, from: "sub")
+                        == nil,
+                    "a claude subagent's event is dropped before anything is written"
+                )
+                let nested = #"{"session_id":"main","tool_input":{"agent_id":"quoted-subagent"}}"#
+                expect(runHook(event: "PostToolUse", agent: "claude", payload: nested, from: "nested") != nil,
+                       "an agent_id inside tool input is not mistaken for a subagent hook")
+                let idle = #"{"session_id":"main","notification_type":"idle_prompt"}"#
+                expectEqual(runHook(event: "Notification", agent: "claude", payload: idle, from: "idle")?["event"] as? String,
+                            "IdlePrompt", "idle reminders have their own silent recovery event")
+                let escaped = #"{"session_id":"thr_123","turn_id":"turn_456","transcript_path":"/tmp/a \"quoted\" 路径.jsonl"}"#
+                let written = runHook(event: "Stop", agent: "codex", payload: escaped, from: "escaped")
+                expectEqual(written?["session"] as? String, "thr_123", "session ids are not stripped of underscores")
+                expectEqual(written?["turn"] as? String, "turn_456", "turn ids support transcript correlation")
+                expectEqual(written?["transcript"] as? String, "/tmp/a \"quoted\" 路径.jsonl", "JSON paths retain quotes and Unicode")
+            }),
+
+            .act("codex can hand the payload over as an argument", {
+                let payload = #"{"session_id":"01a08a56-ec58-7bc3-9294-1b9806fc99ba","#
+                    + #""transcript_path":"/tmp/rollout.jsonl","hook_event_name":"Stop"}"#
+                let written = runHook(
+                    event: "Stop", agent: "codex", payload: payload,
+                    onStdin: false, from: "codexed")
+                expectEqual(
+                    written?["session"] as? String, "01a08a56-ec58-7bc3-9294-1b9806fc99ba",
+                    "an argument payload is read the same way a piped one is")
+                expectEqual(written?["agent"] as? String, "codex", "and named as codex's")
+            }),
+
+            .act("what the hook writes is what the store reads", {
+                let store = AgentActivityStore(directory: hookDirectory)
+                store.reload()
+
+                expectEqual(store.state(ofAgent: "hooked"), .finished, "the turn ended")
+                let session = store.session(ofAgent: "hooked", running: .claude)
+                expectEqual(
+                    session?.id, "11111111-2222-3333-4444-555555555555",
+                    "the session id survives the round trip")
+                expectEqual(
+                    session?.transcript, "/tmp/tabterm-transcript.jsonl",
+                    "and so does the transcript path")
+                expect(
+                    store.session(ofAgent: "hooked", running: .codex) == nil,
+                    "a claude session is never offered to a codex process")
+                expect(
+                    store.session(ofAgent: "bare", running: .claude) == nil,
+                    "and a report with no session id offers nothing")
+
+                try? FileManager.default.removeItem(at: hookDirectory)
+            }),
+
+            .act("merging into the files on this machine keeps them intact", {
+                // The fixtures above are made up; these are whatever is really
+                // in the home directory, read and merged but never written.
+                // A settings file full of other tools' hooks is the case that
+                // matters, and it is the one hardest to invent.
+                for target in AgentHooks.targets {
+                    let agent = target.agent.rawValue
+                    guard let data = try? Data(contentsOf: target.settingsURL),
+                          let existing = (try? JSONSerialization.jsonObject(with: data))
+                            as? [String: Any]
+                    else {
+                        expect(true, "no \(agent) settings on this machine to merge into")
+                        continue
+                    }
+
+                    let theirs = (existing["hooks"] as? [String: Any])?
+                        .mapValues { ($0 as? [[String: Any]])?.count ?? 0 } ?? [:]
+                    let merged = AgentHooks.settings(
+                        byAdding: existing, scriptPath: AgentHooks.scriptURL.path, target: target)
+
+                    expectEqual(
+                        merged.keys.count, existing.keys.count,
+                        "\(agent): the merge adds no settings of its own")
+                    for key in existing.keys where key != "hooks" {
+                        expect(merged[key] != nil, "\(agent): \(key) is left alone")
+                    }
+
+                    let after = (merged["hooks"] as? [String: Any]) ?? [:]
+                    for (event, count) in theirs {
+                        expect(
+                            ((after[event] as? [[String: Any]])?.count ?? 0) >= count,
+                            "\(agent): nothing is dropped from \(event)")
+                    }
+
+                    // Ours replace ours rather than piling up, even though the
+                    // command they contain has changed shape since.
+                    let twice = AgentHooks.settings(
+                        byAdding: merged, scriptPath: AgentHooks.scriptURL.path, target: target)
+                    expectEqual(
+                        ((twice["hooks"] as? [String: Any])?.mapValues {
+                            ($0 as? [[String: Any]])?.count ?? 0
+                        }) ?? [:],
+                        after.mapValues { ($0 as? [[String: Any]])?.count ?? 0 },
+                        "\(agent): installing again changes nothing")
+                }
+            }),
+
+            .act("codex is registered with the events it actually has", {
+                guard let codex = AgentHooks.targets.first(where: { $0.agent == .codex }),
+                      let claude = AgentHooks.targets.first(where: { $0.agent == .claude })
+                else { return expect(false, "both agents have a hook target") }
+
+                expectEqual(
+                    codex.settingsURL.lastPathComponent, "hooks.json",
+                    "codex keeps its hooks in their own file")
+                expect(
+                    claude.settingsURL.path.hasSuffix("/.claude/settings.json"),
+                    "claude keeps its in settings.json")
+
+                let registered = AgentHooks.registrations(for: codex)
+                expect(
+                    registered.allSatisfy { codex.events.contains($0.event) },
+                    "nothing is registered with codex that codex doesn't know")
+                expect(
+                    registered.count < AgentHooks.registrations.count,
+                    "which is fewer than claude takes")
+                expect(
+                    registered.contains { $0.event == "Stop" },
+                    "but still the event that ends a turn")
+                expect(
+                    !registered.contains { $0.event == "Notification" },
+                    "and not the ones only claude sends")
+
+                let settings = AgentHooks.settings(
+                    byAdding: [:], scriptPath: "/tmp/\(AgentHooks.scriptName)", target: codex)
+                let hooks = settings["hooks"] as? [String: Any] ?? [:]
+                expectEqual(hooks.count, registered.count, "the file gets exactly those events")
+                let stop = (hooks["Stop"] as? [[String: Any]])?.first
+                let entry = (stop?["hooks"] as? [[String: Any]])?.first
+                expect(
+                    (entry?["command"] as? String)?.hasSuffix("Stop codex || true") == true,
+                    "and each one tells the script which agent is calling it")
             }),
 
             .act("a terminal carries its agent id into the pty", {
@@ -1548,6 +2507,157 @@ enum SelfTest {
                 envTerminal?.close()
                 envTerminal = nil
                 if let envProbe { try? FileManager.default.removeItem(at: envProbe) }
+            }),
+
+            .act("a terminal takes files dropped on it", {
+                let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+                let probe = directory.appendingPathComponent("tabterm-drop-\(UUID().uuidString)")
+                let ready = directory.appendingPathComponent("tabterm-drop-ready-\(UUID().uuidString)")
+                dropProbe = probe
+                dropReady = ready
+
+                // A name that needs escaping, as screenshots' names do.
+                let files = [
+                    directory.appendingPathComponent("Screenshot 2026-09-24 at 10.00.00.png"),
+                    directory.appendingPathComponent("it's (1).jpg"),
+                ]
+                dropFiles = files
+                dropExpected = files.map { Ghostty.Shell.escape($0.path) }.joined(separator: " ")
+                expectEqual(
+                    Ghostty.Shell.escape("/tmp/it's (1).jpg"),
+                    "/tmp/it\\'s\\ \\(1\\).jpg",
+                    "paths are escaped so the shell reads each as one word"
+                )
+
+                // No newline follows a drop, so read raw bytes rather than lines.
+                let surface = GhosttySurfaceView(
+                    command: "sh -c 'stty -icanon; : > \(ready.path); "
+                        + "head -c \(dropExpected.utf8.count) > \(probe.path)'"
+                )
+                dropSurface = surface
+
+                let types = surface.registeredDraggedTypes
+                expect(types.contains(.fileURL), "the terminal accepts dropped files")
+                expect(
+                    !types.contains(SplitContainerView.tabPasteboardType),
+                    "but leaves dragged tabs to the pane area behind it"
+                )
+                expectEqual(
+                    surface.draggingEntered(FakeDrag(files: files)), .copy,
+                    "hovering files over it offers a copy"
+                )
+                expectEqual(
+                    surface.draggingEntered(FakeDrag(tabID: UUID(), location: .zero)), [],
+                    "hovering a tab over it offers nothing"
+                )
+            }),
+
+            .waitUntil("the drop reader is listening", {
+                guard let dropReady else { return false }
+                return FileManager.default.fileExists(atPath: dropReady.path)
+            }),
+
+            .act("drop the files", {
+                expect(
+                    dropSurface?.performDragOperation(FakeDrag(files: dropFiles)) == true,
+                    "the drop is accepted"
+                )
+            }),
+
+            .waitUntil("and the terminal receives their escaped paths", {
+                guard let dropProbe,
+                      let written = try? String(contentsOf: dropProbe, encoding: .utf8)
+                else { return false }
+                return written == dropExpected
+            }),
+
+            .act("done with the drop terminal", {
+                dropSurface?.close()
+                dropSurface = nil
+                for file in [dropProbe, dropReady].compactMap({ $0 }) {
+                    try? FileManager.default.removeItem(at: file)
+                }
+            }),
+
+            .act("a restored terminal types its session back at the shell", {
+                let (runner, probe) = makeRunner(mark: "resumed")
+                resumeProbe = probe
+                resumeRunner = runner
+
+                let session = AgentSession(
+                    agent: .claude,
+                    sessionID: "probe",
+                    commandLine: [runner.path, runner.path]
+                )
+                expectEqual(
+                    session?.resumeCommand,
+                    "\(runner.path) --resume probe",
+                    "the line is built before anything is typed"
+                )
+
+                // No `command:` — a restored pane gets the user's own shell,
+                // and the agent is typed at it, so quitting the agent leaves
+                // them at a prompt rather than closing the pane.
+                resumeTerminal = TerminalTabContent(resume: session)
+            }),
+
+            .waitUntil("and the shell runs it once it is ready", {
+                guard let resumeProbe,
+                      let written = try? String(contentsOf: resumeProbe, encoding: .utf8)
+                else { return false }
+                return written == "resumed"
+            }),
+
+            .act("a pane saved mid-session comes back in it", {
+                let (runner, probe) = makeRunner(mark: "restored")
+                restoreProbe = probe
+                restoreRunner = runner
+
+                // The row a quit with an agent still running leaves behind.
+                // Written straight into the database because the alternative is
+                // a live agent: `persist` reads the session off the process,
+                // and there is no real one here to read.
+                let session = AgentSession(
+                    agent: .claude,
+                    sessionID: "restored",
+                    commandLine: [runner.path, runner.path]
+                )
+                let layout = SavedLayout.pane(directory: nil, agent: session, focused: true)
+
+                controller.selectWorkspace(.home)
+                SavedTabStore.replace(worktreeId: nil, with: [
+                    SavedTab(worktreeId: nil, position: 0, isSelected: true, layout: layout.json)
+                ])
+
+                // Drop the live workspace so it has to rebuild from the row.
+                controller.discardWorkspacesForTesting()
+                controller.selectWorkspace(.home)
+                expectEqual(controller.tabSnapshot.count, 1, "the saved tab came back")
+                expect(
+                    controller.selectedTabContent is TerminalTabContent,
+                    "as a terminal, not something else"
+                )
+            }),
+
+            .waitUntil("and the agent it was in is typed back into it", {
+                guard let restoreProbe,
+                      let written = try? String(contentsOf: restoreProbe, encoding: .utf8)
+                else { return false }
+                return written == "restored"
+            }),
+
+            .act("done with the resumed terminal", {
+                resumeTerminal?.close()
+                resumeTerminal = nil
+                if let resumeProbe { try? FileManager.default.removeItem(at: resumeProbe) }
+                if let resumeRunner { try? FileManager.default.removeItem(at: resumeRunner) }
+                if let restoreProbe { try? FileManager.default.removeItem(at: restoreProbe) }
+                if let restoreRunner { try? FileManager.default.removeItem(at: restoreRunner) }
+
+                // Hand the later steps a plain tab again.
+                for entry in controller.tabSnapshot { controller.closeTab(entry.id) }
+                controller.addTab()
+                expectEqual(controller.tabSnapshot.count, 1, "workspace reset for later steps")
             }),
 
             .act("an agent reports into the workspace on screen", {
@@ -1609,6 +2719,235 @@ enum SelfTest {
                 expect(
                     AgentStatusDotView.tooltip(for: .idle) == nil,
                     "an idle row explains nothing, because it shows nothing")
+            }),
+
+            .act("hidden tabs keep their notifications when their workspace is selected", {
+                let key = controller.currentWorkspaceKey
+                let previous = controller.selectedTabID
+                let hidden = controller.addTab()
+                let visible = controller.addTab()
+                defer {
+                    controller.closeTab(hidden.id)
+                    controller.closeTab(visible.id)
+                    if let previous { controller.selectTab(previous) }
+                }
+                guard let agentID = hidden.agentIDs.first else {
+                    return expect(false, "the hidden tab has an agent id")
+                }
+                let store = AgentActivityStore.shared
+                let event = "{\"event\":\"Stop\",\"at\":\(Date().timeIntervalSince1970)}"
+                try? event.write(
+                    to: store.directory.appendingPathComponent("\(agentID).json"),
+                    atomically: true, encoding: .utf8
+                )
+                store.reload()
+                controller.selectWorkspace(key)
+                expectEqual(store.state(ofAgent: agentID), .finished, "visiting the workspace does not acknowledge hidden tabs")
+                let hiddenButton = tabButton(for: hidden.id, in: controller)
+                let visibleButton = tabButton(for: visible.id, in: controller)
+                expectEqual(hiddenButton?.agentState, .finished, "the hidden tab shows its completion")
+                expect(hiddenButton?.isSelected == false, "attention does not select the tab")
+                expect(visibleButton?.isSelected == true, "the current tab remains highlighted")
+                expect(hiddenButton?.toolTip?.contains("Agent finished") == true, "the tab explains why it needs attention")
+
+                store.acknowledge([agentID])
+                expectEqual(tabButton(for: hidden.id, in: controller)?.agentState, .idle, "acknowledging refreshes the tab indicator")
+                store.forget(agentID)
+            }),
+
+            // MARK: Sessions and phones
+
+            .act("the pane's shell runs in a session Workbench owns", {
+                controller.selectWorkspace(.home)
+                if controller.tabSnapshot.isEmpty { controller.addTab() }
+                guard let terminal = controller.selectedTabContent as? TerminalTabContent else {
+                    return expect(false, "a terminal is selected")
+                }
+                phoneTerminal = terminal
+                let phase = SessionManager.shared.queue.sync { terminal.session.phase }
+                expect(phase != .pending, "the pane attached and started its shell")
+            }),
+
+            .waitUntil("shell integration reports the directory through the session", {
+                phoneTerminal?.pwd != nil
+            }),
+
+            .act("nothing is running at the prompt", {
+                expect(phoneTerminal?.hasRunningProcess == false, "a shell at its prompt has nothing to lose")
+                phoneTerminal?.send("sleep 30\n")
+            }),
+
+            .waitUntil("but a command in the foreground counts", {
+                phoneTerminal?.hasRunningProcess == true
+            }),
+
+            .act("interrupting it", {
+                phoneTerminal?.send("\u{03}")
+            }),
+
+            .waitUntil("puts the shell back in front", {
+                phoneTerminal?.hasRunningProcess == false
+            }),
+
+            .act("a phone pairs with a one-time code", {
+                do {
+                    phonePort = try RemoteServer.shared.startForTesting()
+                } catch {
+                    return expect(false, "the phone server listens on the loopback: \(error)")
+                }
+                let code = PairingStore.makeCode()
+                pairingCode = code
+                let phone = TestPhone()
+                expect(phone.connect(port: phonePort), "a phone connects")
+                phone.send(.hello(Hello(deviceName: "Self-test iPhone", deviceToken: nil, pairingCode: code)))
+                phones.append(phone)
+            }),
+
+            .waitUntil("it is welcomed with a token of its own", {
+                phones.first?.welcome?.deviceToken != nil
+            }),
+
+            .waitUntil("and sent the sidebar, focused on the terminal on screen", {
+                guard let state = phones.first?.state, let terminal = phoneTerminal else { return false }
+                return state.focus?.session == terminal.sessionID
+                    && state.locate(terminal.sessionID) != nil
+            }),
+
+            .act("the same code doesn't let a second phone in", {
+                let intruder = TestPhone()
+                expect(intruder.connect(port: phonePort), "a second phone connects")
+                intruder.send(.hello(Hello(deviceName: "Intruder", deviceToken: nil, pairingCode: pairingCode)))
+                phones.append(intruder)
+            }),
+
+            .waitUntil("it is turned away", {
+                phones.last?.denied?.reason == .unauthorized
+            }),
+
+            .act("the phone attaches to the terminal", {
+                guard let phone = phones.first, let terminal = phoneTerminal else { return }
+                macSize = SessionManager.shared.queue.sync { terminal.session.size }
+                expect(macSize.cols > 40, "the Mac pane is wider than a phone (\(macSize.cols) columns)")
+                phone.send(.attach(Attach(
+                    session: terminal.sessionID,
+                    anchor: .fresh,
+                    size: TerminalSize(cols: 40, rows: 12)
+                )))
+            }),
+
+            .waitUntil("a fresh phone is told to reset and replay", {
+                guard let terminal = phoneTerminal else { return false }
+                return phones.first?.synced(terminal.sessionID)?.mode == .reset
+            }),
+
+            .waitUntil("and the terminal takes the smaller size", {
+                guard let terminal = phoneTerminal else { return false }
+                let size = SessionManager.shared.queue.sync { terminal.session.size }
+                return size.cols == 40 && size.rows == 12
+            }),
+
+            .act("a message typed on the phone", {
+                guard let terminal = phoneTerminal else { return }
+                phones.first?.send(.submit(Submit(session: terminal.sessionID, text: "echo tabterm-$((6*7))-phone")))
+            }),
+
+            .waitUntil("runs, and its output comes back to the phone", {
+                guard let terminal = phoneTerminal else { return false }
+                return phones.first?.text(terminal.sessionID).contains("tabterm-42-phone") == true
+            }),
+
+            .act("the phone drops off and reconnects with its token", {
+                guard let first = phones.first, let token = first.welcome?.deviceToken,
+                      let terminal = phoneTerminal
+                else { return expect(false, "a paired phone") }
+                let anchor = first.anchor(terminal.sessionID)
+                first.close()
+
+                let again = TestPhone()
+                expect(again.connect(port: phonePort), "the phone reconnects")
+                again.send(.hello(Hello(deviceName: "Self-test iPhone", deviceToken: token, pairingCode: nil)))
+                again.send(.attach(Attach(
+                    session: terminal.sessionID,
+                    anchor: anchor,
+                    size: TerminalSize(cols: 40, rows: 12)
+                )))
+                phones.append(again)
+            }),
+
+            .waitUntil("and is caught up exactly, keeping its screen", {
+                guard let terminal = phoneTerminal else { return false }
+                return phones.last?.synced(terminal.sessionID)?.mode == .exact
+            }),
+
+            .act("the phone goes to the background", {
+                guard let terminal = phoneTerminal else { return }
+                phones.last?.send(.visibility(Visibility(session: terminal.sessionID, visible: false)))
+            }),
+
+            .waitUntil("and the Mac gets its size back", {
+                guard let terminal = phoneTerminal else { return false }
+                let size = SessionManager.shared.queue.sync { terminal.session.size }
+                return size.cols == macSize.cols && size.rows == macSize.rows
+            }),
+
+            .act("the phone asks for a worktree on a branch that doesn't exist yet", {
+                // The scratch repository was taken out of the sidebar again
+                // further up; its checkout is still on disk.
+                guard let path = temporaryRepo,
+                      let repository = try? RepositoryStore.add(path: path),
+                      let main = RepositoryStore.worktrees(ofRepository: repository.id ?? -1)
+                          .first(where: \.isMain)?.id
+                else { return expect(false, "a repository for the phone to add to") }
+                phoneRepository = repository
+                controller.reloadSidebar()
+                phones.last?.send(.newWorktree(NewWorktree(
+                    workspace: WorkspaceKey.worktree(main).stateValue,
+                    branch: "phone/made-this",
+                    requestID: "worktree-1"
+                )))
+            }),
+
+            .waitUntil("and is told the workspace it became, once the sidebar has it", {
+                guard let phone = phones.last, let created = phone.worktreeCreated("worktree-1") else { return false }
+                return phone.state?.workspace(id: created.workspace) != nil
+            }),
+
+            .act("the worktree is made the way the sheet makes one", {
+                guard let phone = phones.last, let created = phone.worktreeCreated("worktree-1"),
+                      let workspace = phone.state?.workspace(id: created.workspace),
+                      let path = temporaryRepo
+                else { return expect(false, "a workspace for the new worktree") }
+                expectEqual(workspace.branch, "phone/made-this", "on a new branch of that name")
+                expect(
+                    workspace.directory?.hasSuffix("-worktrees/phone-made-this") == true
+                        && FileManager.default.fileExists(atPath: path + "-worktrees/phone-made-this"),
+                    "in the sibling folder, slashes flattened"
+                )
+                expect(!workspace.isOpen, "with no terminals until someone opens it")
+                expect(
+                    controller.currentWorkspaceKey.stateValue != created.workspace,
+                    "and the Mac's window stays where it was"
+                )
+
+                // The branch is checked out now, and git won't have it twice.
+                phone.send(.newWorktree(NewWorktree(
+                    workspace: created.workspace,
+                    branch: "phone/made-this",
+                    requestID: "worktree-2"
+                )))
+            }),
+
+            .waitUntil("asking for the same branch again is refused, in git's words", {
+                guard let phone = phones.last, phone.worktreeCreated("worktree-2") == nil else { return false }
+                return phone.errors.last?.contains("phone/made-this") == true
+            }),
+
+            .act("done with the phones", {
+                if let phoneRepository { RepositoryStore.remove(phoneRepository) }
+                controller.reloadSidebar()
+                for phone in phones { phone.close() }
+                phones.removeAll()
+                RemoteServer.shared.stop()
             }),
         ], then: {
             try? FileManager.default.removeItem(at: agentDirectory)

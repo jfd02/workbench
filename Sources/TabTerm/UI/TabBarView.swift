@@ -1,4 +1,5 @@
 import AppKit
+import TabTermKit
 
 /// A single clickable tab in the tab bar.
 ///
@@ -12,20 +13,18 @@ final class TabButtonView: NSView, NSDraggingSource {
     }
 
     var title: String = "" {
-        didSet { titleLabel.stringValue = title; toolTip = title }
+        didSet { titleLabel.stringValue = title; updateAccessibility() }
     }
 
-    /// A tab shows the kind of its focused pane, which changes as panes are
-    /// split, dropped in, or closed.
-    var kind: TabKind {
+    var agentState: AgentStatus = .idle {
         didSet {
-            guard kind != oldValue else { return }
-            updateIcon()
+            statusDot.setState(agentState)
+            updateAppearance()
         }
     }
 
-    /// A favicon, or the mark of the program running in a terminal. Nil falls
-    /// back to the symbol for the tab's kind.
+    /// The mark of the program running in the focused pane's terminal. Nil
+    /// falls back to the terminal symbol.
     var icon: NSImage? {
         didSet {
             guard icon !== oldValue else { return }
@@ -40,6 +39,8 @@ final class TabButtonView: NSView, NSDraggingSource {
     private let iconView = NSImageView()
     private let closeButton = NSButton()
     private let shortcutLabel = NSTextField(labelWithString: "")
+    private let statusDot = AgentStatusDotView(frame: .zero)
+    private let selectionIndicator = CALayer()
 
     /// 1…9 for the tabs ⌘1…⌘9 can reach, nil beyond that.
     var shortcutNumber: Int? {
@@ -60,13 +61,14 @@ final class TabButtonView: NSView, NSDraggingSource {
     /// Where the mouse went down, so a drag can be told from a click.
     private var mouseDownLocation: NSPoint?
 
-    init(tabID: UUID, kind: TabKind, title: String) {
+    init(tabID: UUID, title: String) {
         self.tabID = tabID
-        self.kind = kind
         super.init(frame: .zero)
 
         wantsLayer = true
         layer?.cornerRadius = 6
+        selectionIndicator.cornerRadius = 1.5
+        layer?.addSublayer(selectionIndicator)
         translatesAutoresizingMaskIntoConstraints = false
 
         updateIcon()
@@ -103,11 +105,13 @@ final class TabButtonView: NSView, NSDraggingSource {
         shortcutLabel.translatesAutoresizingMaskIntoConstraints = false
         shortcutLabel.setContentHuggingPriority(.required, for: .horizontal)
         shortcutLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        statusDot.translatesAutoresizingMaskIntoConstraints = false
 
         addSubview(iconView)
         addSubview(titleLabel)
         addSubview(shortcutLabel)
         addSubview(closeButton)
+        addSubview(statusDot)
 
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 30),
@@ -123,10 +127,17 @@ final class TabButtonView: NSView, NSDraggingSource {
             // The badge and the close button share the trailing slot; only one
             // shows at a time, so the title stops short of whichever is wider.
             titleLabel.trailingAnchor.constraint(
-                equalTo: shortcutLabel.leadingAnchor, constant: -4),
+                equalTo: statusDot.leadingAnchor, constant: -6),
+
+            statusDot.trailingAnchor.constraint(equalTo: shortcutLabel.leadingAnchor, constant: -6),
+            statusDot.centerYAnchor.constraint(equalTo: centerYAnchor),
+            statusDot.widthAnchor.constraint(equalToConstant: AgentStatusDotView.diameter),
+            statusDot.heightAnchor.constraint(equalToConstant: AgentStatusDotView.diameter),
 
             shortcutLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
             shortcutLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            // Tabs past ⌘9 have no shortcut text, but still need room for ×.
+            shortcutLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 16),
 
             closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
             closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -154,11 +165,29 @@ final class TabButtonView: NSView, NSDraggingSource {
         trackingArea = area
     }
 
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        selectionIndicator.frame = CGRect(x: 8, y: 0, width: max(0, bounds.width - 16), height: 3)
+        CATransaction.commit()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateAppearance()
+    }
+
     /// What the tab is actually drawing, for the self-test.
     var iconImageForTesting: NSImage? { iconView.image }
 
     override func mouseEntered(with event: NSEvent) { isHovered = true }
     override func mouseExited(with event: NSEvent) { isHovered = false }
+
+    override func accessibilityPerformPress() -> Bool {
+        onSelect?()
+        return true
+    }
 
     override func mouseDown(with event: NSEvent) {
         onSelect?()
@@ -179,6 +208,18 @@ final class TabButtonView: NSView, NSDraggingSource {
 
     override func mouseUp(with event: NSEvent) {
         mouseDownLocation = nil
+    }
+
+    /// Middle-click closes the tab, the way it does in a browser. Only button 2
+    /// — the side buttons on a mouse that has them come through here too, and
+    /// closing a tab is not what they're for. It goes through the same request
+    /// as the close button, so a tab with something running still asks first.
+    override func otherMouseUp(with event: NSEvent) {
+        guard event.buttonNumber == 2 else {
+            return super.otherMouseUp(with: event)
+        }
+        guard bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
+        onClose?()
     }
 
     @objc private func closeClicked() {
@@ -220,8 +261,7 @@ final class TabButtonView: NSView, NSDraggingSource {
             iconView.image = icon
             iconView.imageScaling = .scaleProportionallyUpOrDown
         } else {
-            let symbol = kind == .terminal ? "terminal" : "globe"
-            iconView.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            iconView.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: nil)
         }
         updateAppearance()
     }
@@ -229,17 +269,28 @@ final class TabButtonView: NSView, NSDraggingSource {
     private func updateAppearance() {
         let background: NSColor
         if isSelected {
-            background = .controlAccentColor.withAlphaComponent(0.18)
+            background = .controlAccentColor.withAlphaComponent(0.24)
+        } else if agentState.wantsAttention {
+            background = .systemRed.withAlphaComponent(isHovered ? 0.16 : 0.09)
         } else if isHovered {
             background = .labelColor.withAlphaComponent(0.08)
         } else {
             background = .clear
         }
-        layer?.backgroundColor = background.cgColor
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = background.cgColor
+            layer?.borderColor = (isSelected ? NSColor.controlAccentColor.withAlphaComponent(0.6)
+                : NSColor.systemRed.withAlphaComponent(0.4)).cgColor
+            selectionIndicator.backgroundColor = NSColor.controlAccentColor.cgColor
+        }
+        layer?.borderWidth = (isSelected || agentState.wantsAttention) ? 1 : 0
+        selectionIndicator.isHidden = !isSelected
 
         let textColor: NSColor = isSelected ? .labelColor : .secondaryLabelColor
         titleLabel.textColor = textColor
+        titleLabel.font = .systemFont(ofSize: 13, weight: isSelected ? .semibold : .regular)
         iconView.contentTintColor = textColor
+        updateAccessibility()
 
         // Hovering (or being the current tab) offers the close button; the rest
         // of the time an unselected tab advertises the key that reaches it.
@@ -247,6 +298,15 @@ final class TabButtonView: NSView, NSDraggingSource {
         closeButton.animator().alphaValue = showsClose ? 1 : 0
         shortcutLabel.animator().alphaValue =
             (!showsClose && shortcutNumber != nil) ? 1 : 0
+    }
+
+    private func updateAccessibility() {
+        let status = AgentStatusDotView.tooltip(for: agentState)
+        toolTip = [titleLabel.stringValue, status].compactMap { $0 }.joined(separator: " — ")
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(toolTip)
+        setAccessibilityValue(isSelected ? "Selected" : "Not selected")
     }
 }
 
@@ -462,15 +522,15 @@ final class TabBarView: NSView {
             if let existing = buttons[tab.id] {
                 button = existing
             } else {
-                button = TabButtonView(tabID: tab.id, kind: tab.kind, title: tab.title)
+                button = TabButtonView(tabID: tab.id, title: tab.title)
                 button.onSelect = { [weak self] in self?.onSelectTab?(tab.id) }
                 button.onClose = { [weak self] in self?.onCloseTab?(tab.id) }
                 buttons[tab.id] = button
             }
 
             button.title = tab.title
-            button.kind = tab.kind
             button.icon = tab.icon
+            button.agentState = AgentActivityStore.shared.state(ofAgents: tab.agentIDs)
             button.isSelected = tab.id == selectedID
             // ⌘1…⌘9 only reach the first nine.
             button.shortcutNumber = ordered.count < 9 ? ordered.count + 1 : nil

@@ -1,5 +1,6 @@
 # Swift Package Manager
 .build/
+.swiftpm/
 
 # scripts/bundle.sh output and the ghostty source checkout it clones
 build/
@@ -8,3 +9,14 @@ build/
 Frameworks/GhosttyKit.xcframework/
 
 .DS_Store
+
+# Xcode's per-user state for the iPhone app
+xcuserdata/
+
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+*.p8
+*.p12
+*.mobileprovision

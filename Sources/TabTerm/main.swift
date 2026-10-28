@@ -1,11 +1,16 @@
 import AppKit
 
+// A pane's Ghostty surface runs this binary again as its attach process. That
+// has nothing to do with the app, so it branches off before any of the app is
+// touched — no NSApplication, no libghostty, no database.
+if AttachClient.isRequested {
+    AttachClient.run()
+}
+
 // Redirect storage before anything touches AppDatabase.shared, so the harness
 // never writes to the real database.
 if SelfTest.isEnabled {
     AppDatabase.useTemporaryDatabase()
-    // No step of the self-test may depend on the network being there.
-    FaviconStore.networkEnabled = false
 }
 
 // Create the NSApplication first: libghostty setup below queries NSApp, which

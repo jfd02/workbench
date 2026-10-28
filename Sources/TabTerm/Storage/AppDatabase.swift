@@ -6,15 +6,26 @@ import GRDB
 /// status hook and the state files it leaves.
 enum AppSupport {
     static let directory: URL = {
+        // A second, separate Workbench — for trying a build against a phone
+        // without it opening your real workspaces and resuming your agents.
+        if let override = ProcessInfo.processInfo.environment["TABTERM_DATA_DIR"], !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
         )[0]
+        // Keep the original directory so the Workbench rename preserves saved workspaces.
         return base.appendingPathComponent("TabTerm", isDirectory: true)
     }()
+
+    /// True when running against a data directory other than the real one.
+    static var isOverridden: Bool {
+        !(ProcessInfo.processInfo.environment["TABTERM_DATA_DIR"] ?? "").isEmpty
+    }
 }
 
-/// The app's SQLite store. Everything TabTerm persists lives here.
+/// The app's SQLite store. Everything Workbench persists lives here.
 ///
 /// If the database file can't be opened we fall back to an in-memory one so the
 /// app still runs — it just won't remember anything between launches.
@@ -137,6 +148,38 @@ final class AppDatabase {
                 // A 32×32 PNG, whatever the site actually served.
                 t.column("data", .blob).notNull()
                 t.column("fetchedAt", .double).notNull()
+            }
+        }
+
+        migrator.registerMigration("v6-removeBrowser") { db in
+            // The embedded browser is gone, and its pinned sites and cached
+            // icons go with it. The two earlier migrations are left as they
+            // were: history stays honest, and a fresh database pays for one
+            // create it immediately undoes.
+            try db.drop(table: "pinnedSite")
+            try db.drop(table: "favicon")
+
+            // Every pane is a terminal now, so a saved tab needs neither a kind
+            // nor a URL — where each pane started is in `layout`.
+            try db.alter(table: "savedTab") { t in
+                t.drop(column: "kind")
+                t.drop(column: "url")
+            }
+        }
+
+        migrator.registerMigration("v7-pairedDevice") { db in
+            // Phones allowed to connect. Only a hash of each one's token is
+            // kept, so the database alone is not enough to impersonate one.
+            try db.create(table: "pairedDevice") { t in
+                t.primaryKey("id", .text)
+                t.column("name", .text).notNull()
+                t.column("tokenHash", .text).notNull().unique()
+                t.column("createdAt", .double).notNull()
+                t.column("lastSeenAt", .double)
+                // Where to send notifications, once the phone has said.
+                t.column("pushToken", .text)
+                t.column("pushEnvironment", .text)
+                t.column("pushTopic", .text)
             }
         }
 

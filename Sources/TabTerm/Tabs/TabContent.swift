@@ -1,29 +1,23 @@
 import AppKit
 
-/// What kind of thing a tab holds.
-enum TabKind {
-    case terminal
-    case browser
-}
-
 /// The content hosted inside a pane.
 ///
-/// Both terminal and browser content implement this so a tab's panes can be
-/// treated uniformly, whatever they hold.
+/// A pane holds a terminal. The protocol keeps the tab machinery — titles,
+/// focus, closing — written in terms of content rather than terminals, so a
+/// pane's contents can be treated uniformly.
 protocol TabContent: AnyObject {
     var view: NSView { get }
     var title: String { get }
-    var kind: TabKind { get }
 
-    /// Icon for the tab bar: a site's favicon, or the mark of the program
-    /// running in a terminal. Nil means the tab shows the kind's own symbol.
+    /// Icon for the tab bar: the mark of the program running in a terminal.
+    /// Nil means the tab shows its own symbol.
     var icon: NSImage? { get }
 
-    /// Called when the content's title changes (terminal title, page title).
+    /// Called when the content's title changes.
     var onTitleChange: ((String) -> Void)? { get set }
 
-    /// Called when `icon` changes — a page finished loading and named its
-    /// favicon, or a terminal started running something we have a mark for.
+    /// Called when `icon` changes — a terminal started running something we
+    /// have a mark for.
     var onIconChange: ((NSImage?) -> Void)? { get set }
 
     /// Called when the content wants its pane closed.
@@ -37,7 +31,7 @@ protocol TabContent: AnyObject {
     var closeConfirmationDetail: String { get }
 
     /// True when closing this loses nothing, so no confirmation is warranted:
-    /// a terminal sitting at a prompt, or any web page.
+    /// a terminal sitting at a prompt.
     var isDisposable: Bool { get }
 
     /// Give keyboard focus to whatever should have it.

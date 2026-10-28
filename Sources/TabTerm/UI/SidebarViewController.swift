@@ -1,4 +1,5 @@
 import AppKit
+import TabTermKit
 
 /// A row in the sidebar outline.
 final class SidebarNode: NSObject {
@@ -15,6 +16,14 @@ final class SidebarNode: NSObject {
 
     init(_ kind: Kind) {
         self.kind = kind
+    }
+
+    var repository: Repository? {
+        switch kind {
+        case .repository(let repository), .newWorktree(let repository): return repository
+        case .worktree(let worktree): return RepositoryStore.repository(id: worktree.repositoryId)
+        case .home: return nil
+        }
     }
 
     var title: String {
@@ -34,6 +43,13 @@ final class SidebarNode: NSObject {
             WorktreeActivity.lastActivity(for: worktree)
         ) else { return folder }
         return "\(folder) · \(when)"
+    }
+
+    /// Days since a worktree's code last changed, once that's long enough to
+    /// call it stale.
+    var staleDays: Int? {
+        guard case .worktree(let worktree) = kind else { return nil }
+        return WorktreeActivity.staleDays(for: worktree)
     }
 
     var symbolName: String? {
@@ -83,17 +99,15 @@ final class SidebarNode: NSObject {
 /// Worktrees are two lines — the branch, then which folder it is and when it
 /// was last opened. Everything else is a single line.
 final class SidebarCellView: NSTableCellView {
-    var onAdd: (() -> Void)?
-
-    let addButton = NSButton()
-    /// Collapsed to zero when the button is hidden, so rows that don't have one
-    /// get the full width for their text.
-    private var addButtonWidth: NSLayoutConstraint!
     private let statusDot = AgentStatusDotView()
-    /// Same trick as the button: no dot, no reserved space.
+    /// Collapsed to zero when there's no dot, so the row gets the full width.
     private var statusDotWidth: NSLayoutConstraint!
     private let subtitleLabel = NSTextField(labelWithString: "")
     private let shortcutLabel = NSTextField(labelWithString: "")
+    /// "12d" under a stale worktree's icon.
+    private let staleLabel = NSTextField(labelWithString: "")
+    /// Lifts the icon to make room for `staleLabel` beneath it.
+    private var iconCenterY: NSLayoutConstraint!
 
     /// 1…9 for the workspaces ⌘⇧1…⌘⇧9 can reach, nil beyond that.
     var shortcutNumber: Int? {
@@ -106,15 +120,6 @@ final class SidebarCellView: NSTableCellView {
 
     /// What the badge reads, for the self-test.
     var shortcutTextForTesting: String { shortcutLabel.stringValue }
-    private var trackingArea: NSTrackingArea?
-    private var isHovered = false {
-        didSet { updateAddButton() }
-    }
-
-    /// Only repositories can take a new worktree.
-    var showsAddButton = false {
-        didSet { updateAddButton() }
-    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -136,22 +141,6 @@ final class SidebarCellView: NSTableCellView {
         subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
         subtitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        addButton.image = NSImage(
-            systemSymbolName: "plus",
-            accessibilityDescription: "New worktree"
-        )
-        addButton.symbolConfiguration = .init(pointSize: 12, weight: .medium)
-        addButton.isBordered = false
-        addButton.bezelStyle = .inline
-        addButton.contentTintColor = .secondaryLabelColor
-        addButton.target = self
-        addButton.action = #selector(addClicked)
-        addButton.toolTip = "New worktree from this repository"
-        addButton.setAccessibilityIdentifier("newWorktreeButton")
-        addButton.isHidden = true
-        addButton.translatesAutoresizingMaskIntoConstraints = false
-        addButton.setContentHuggingPriority(.required, for: .horizontal)
-
         statusDot.translatesAutoresizingMaskIntoConstraints = false
         statusDot.setContentHuggingPriority(.required, for: .horizontal)
 
@@ -169,18 +158,29 @@ final class SidebarCellView: NSTableCellView {
         shortcutLabel.setContentHuggingPriority(.required, for: .horizontal)
         shortcutLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
+        staleLabel.font = .monospacedDigitSystemFont(ofSize: 9, weight: .medium)
+        staleLabel.textColor = .secondaryLabelColor
+        staleLabel.alignment = .center
+        staleLabel.isHidden = true
+        staleLabel.translatesAutoresizingMaskIntoConstraints = false
+
         addSubview(icon)
+        addSubview(staleLabel)
         addSubview(text)
         addSubview(shortcutLabel)
         addSubview(statusDot)
-        addSubview(addButton)
         imageView = icon
         textField = label
 
+        iconCenterY = icon.centerYAnchor.constraint(equalTo: centerYAnchor)
+
         NSLayoutConstraint.activate([
             icon.leadingAnchor.constraint(equalTo: leadingAnchor),
-            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconCenterY,
             icon.widthAnchor.constraint(equalToConstant: 20),
+
+            staleLabel.centerXAnchor.constraint(equalTo: icon.centerXAnchor),
+            staleLabel.topAnchor.constraint(equalTo: icon.bottomAnchor, constant: 1),
 
             text.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
             text.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -191,19 +191,11 @@ final class SidebarCellView: NSTableCellView {
                 equalTo: statusDot.leadingAnchor, constant: -4),
             shortcutLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
 
-            // A row never has both, but chaining them means neither has to know
-            // that.
-            statusDot.trailingAnchor.constraint(equalTo: addButton.leadingAnchor),
+            statusDot.trailingAnchor.constraint(equalTo: trailingAnchor),
             statusDot.centerYAnchor.constraint(equalTo: centerYAnchor),
             statusDot.heightAnchor.constraint(equalToConstant: AgentStatusDotView.diameter),
-
-            addButton.trailingAnchor.constraint(equalTo: trailingAnchor),
-            addButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            addButton.heightAnchor.constraint(equalToConstant: 18),
         ])
 
-        addButtonWidth = addButton.widthAnchor.constraint(equalToConstant: 0)
-        addButtonWidth.isActive = true
         statusDotWidth = statusDot.widthAnchor.constraint(equalToConstant: 0)
         statusDotWidth.isActive = true
     }
@@ -239,44 +231,37 @@ final class SidebarCellView: NSTableCellView {
         setAccessibilityLabel(node.title)
     }
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingArea { removeTrackingArea(trackingArea) }
-        let area = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .inVisibleRect, .activeInActiveApp],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(area)
-        trackingArea = area
-    }
-
-    override func mouseEntered(with event: NSEvent) { isHovered = true }
-    override func mouseExited(with event: NSEvent) { isHovered = false }
-
-    private func updateAddButton() {
-        addButton.isHidden = !showsAddButton
-        addButtonWidth.constant = showsAddButton ? 18 : 0
-        // Present but quiet until the row is under the pointer.
-        addButton.alphaValue = isHovered ? 1 : 0.45
-    }
-
-    @objc private func addClicked() {
-        onAdd?()
-    }
-
     private(set) var pullRequestInfo: PullRequestInfo?
+    private(set) var staleDays: Int?
 
     /// Colour the row's icon by where its pull request has got to. Nil leaves
     /// the icon in the normal accent tint, which is most branches.
     func setPullRequest(_ info: PullRequestInfo?) {
         pullRequestInfo = info
-        imageView?.contentTintColor = info?.state.color ?? .controlAccentColor
+        updateIconTint()
+    }
+
+    /// Grey the icon out and count the days under it, for a worktree whose
+    /// code hasn't changed in a while. Nil puts it back.
+    func setStaleDays(_ days: Int?) {
+        staleDays = days
+        staleLabel.stringValue = days.map { "\($0)d" } ?? ""
+        staleLabel.isHidden = days == nil
+        // Centre the icon and its count together, as one block.
+        iconCenterY.constant = days == nil ? 0 : -6
+        updateIconTint()
+    }
+
+    /// Stale wins over a pull request's colour: the count under the icon only
+    /// reads as a warning if the icon above it has gone quiet too.
+    private func updateIconTint() {
+        imageView?.contentTintColor = staleDays != nil
+            ? .secondaryLabelColor
+            : pullRequestInfo?.state.color ?? .controlAccentColor
     }
 
     /// Show what the agents in this worktree are up to, on the row's right edge.
-    func setAgentState(_ state: AgentState) {
+    func setAgentState(_ state: AgentStatus) {
         statusDot.setState(state)
         statusDotWidth.constant = state == .idle ? 0 : AgentStatusDotView.diameter
     }
@@ -285,7 +270,23 @@ final class SidebarCellView: NSTableCellView {
     var iconTintForTesting: NSColor? { imageView?.contentTintColor }
 
     /// The dot's state, for the self-test.
-    var agentStateForTesting: AgentState { statusDot.state }
+    var agentStateForTesting: AgentStatus { statusDot.state }
+}
+
+/// A sidebar row whose selection — the workspace on screen — stays blue.
+///
+/// A source list only paints its selection in the accent colour while it has
+/// keyboard focus. Focus nearly always sits in a terminal, so the stock
+/// highlight is a grey that barely stands out. This draws a soft accent tint
+/// however focus lies.
+final class SidebarRowView: NSTableRowView {
+    override func drawSelection(in dirtyRect: NSRect) {
+        NSColor.controlAccentColor.withAlphaComponent(0.2).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
+    }
+
+    /// Text on the pale tint keeps its usual colours rather than turning white.
+    override var interiorBackgroundStyle: NSView.BackgroundStyle { .normal }
 }
 
 /// The left panel: repositories and their worktrees.
@@ -296,9 +297,15 @@ final class SidebarViewController: NSViewController {
     /// Called after repositories or worktrees change on disk.
     var onStructureChange: (() -> Void)?
 
+    /// Called when worktrees are added or removed outside Workbench, e.g. by an
+    /// agent running `git worktree remove` in a terminal.
+    var onExternalWorktreeChange: (() -> Void)?
+
+    private let worktreeWatcher = WorktreeWatcher()
+
     /// Asked what the agents in a workspace are doing, so the row can show a
     /// dot. The window owns the tabs, so only it can answer.
-    var agentState: ((WorkspaceKey) -> AgentState)?
+    var agentState: ((WorkspaceKey) -> AgentStatus)?
 
     private let outlineView = NSOutlineView()
     private let scrollView = NSScrollView()
@@ -374,7 +381,24 @@ final class SidebarViewController: NSViewController {
         ])
 
         view = root
+
+        // Catch up on anything that changed while the app was closed.
+        for repository in RepositoryStore.all {
+            try? RepositoryStore.refreshWorktrees(of: repository)
+        }
+        worktreeWatcher.onChange = { [weak self] repository in
+            self?.worktreesChangedOnDisk(in: repository)
+        }
         reload()
+    }
+
+    private func worktreesChangedOnDisk(in repository: Repository) {
+        guard let id = repository.id else { return }
+        let before = RepositoryStore.worktrees(ofRepository: id)
+        try? RepositoryStore.refreshWorktrees(of: repository)
+        guard RepositoryStore.worktrees(ofRepository: id) != before else { return }
+        reload()
+        onExternalWorktreeChange?()
     }
 
     // MARK: - Data
@@ -382,6 +406,7 @@ final class SidebarViewController: NSViewController {
     /// Rebuild the tree from the database.
     func reload(selecting key: WorkspaceKey? = nil) {
         let expandedPaths = expandedRepositoryPaths()
+        worktreeWatcher.watch(RepositoryStore.all)
 
         nodes = [SidebarNode(.home)]
         for repository in RepositoryStore.all {
@@ -410,9 +435,12 @@ final class SidebarViewController: NSViewController {
 
         if let key {
             select(key)
+        } else {
+            restoreSelection()
         }
 
         refreshPullRequests()
+        refreshCodeChanges()
     }
 
     private func expandedRepositoryPaths() -> Set<String> {
@@ -440,6 +468,19 @@ final class SidebarViewController: NSViewController {
         outlineView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         selectingProgrammatically = false
         lastSelectedKey = key
+    }
+
+    /// Put the highlight back on the workspace on screen. Rebuilding the tree
+    /// and folding its repository both drop it. A folded repository stays
+    /// folded: the highlight returns when it's unfolded.
+    private func restoreSelection() {
+        guard let key = lastSelectedKey, let node = node(for: key) else { return }
+        let row = outlineView.row(forItem: node)
+        guard row >= 0, row != outlineView.selectedRow else { return }
+
+        selectingProgrammatically = true
+        outlineView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        selectingProgrammatically = false
     }
 
     private func node(for key: WorkspaceKey) -> SidebarNode? {
@@ -475,10 +516,24 @@ final class SidebarViewController: NSViewController {
         }
     }
 
+    /// Ask git when each worktree's code last changed, and redraw when an
+    /// answer moves. Answers are reused for a minute, so this is usually a no-op.
+    private func refreshCodeChanges() {
+        let worktrees = nodes.flatMap(\.children).compactMap { node -> Worktree? in
+            guard case .worktree(let worktree) = node.kind else { return nil }
+            return worktree
+        }
+        WorktreeActivity.refreshCodeChanges(for: worktrees) { [weak self] in
+            self?.outlineView.reloadData()
+        }
+    }
+
     /// Redraw the rows because an agent changed state. Only the dots move, so
     /// this leaves selection and expansion alone.
     func refreshAgentStates() {
         outlineView.reloadData()
+        // An agent that just finished has likely been editing code.
+        refreshCodeChanges()
     }
 
     /// The dot a row should show.
@@ -487,7 +542,7 @@ final class SidebarViewController: NSViewController {
     /// otherwise folding one away would silently take its agents with it. An
     /// open one shows nothing, since every worktree under it is saying so
     /// itself.
-    private func agentState(showing node: SidebarNode) -> AgentState {
+    private func agentState(showing node: SidebarNode) -> AgentStatus {
         guard let agentState else { return .idle }
         if let key = node.workspaceKey { return agentState(key) }
         guard node.isHeader, !outlineView.isItemExpanded(node) else { return .idle }
@@ -545,50 +600,54 @@ final class SidebarViewController: NSViewController {
 
     /// Create a worktree in whichever repository `node` belongs to.
     func addWorktree(for node: SidebarNode) {
-        let repository: Repository
-        switch node.kind {
-        case .repository(let value):
-            repository = value
-        case .worktree(let worktree):
-            guard let owner = RepositoryStore.repository(id: worktree.repositoryId) else { return }
-            repository = owner
-        case .newWorktree(let value):
-            repository = value
-        case .home:
-            return
-        }
+        guard let repository = node.repository else { return }
 
         guard let window = view.window else { return }
         let dialog = NewWorktreeDialog(repository: repository) { [weak self] result in
             guard let self, let result else { return }
-            do {
-                try GitService.addWorktree(
-                    repositoryPath: repository.path,
-                    path: result.path,
-                    branch: result.branch,
-                    createBranch: result.createBranch,
-                    startPoint: result.startPoint
-                )
-                try RepositoryStore.refreshWorktrees(of: repository)
-                self.reload()
-
-                if let created = RepositoryStore
-                    .worktrees(ofRepository: repository.id ?? -1)
-                    .first(where: { $0.path == result.path }),
-                   let id = created.id
-                {
-                    self.select(.worktree(id))
-                    if let node = self.node(for: .worktree(id)) { self.onSelect?(node) }
+            // Off the main thread: creating a branch fetches origin first.
+            DispatchQueue.global(qos: .userInitiated).async {
+                let outcome = Result {
+                    try GitService.addWorktree(
+                        repositoryPath: repository.path,
+                        path: result.path,
+                        branch: result.branch,
+                        createBranch: result.createBranch,
+                        startPoint: result.startPoint,
+                        track: result.trackStartPoint
+                    )
                 }
-                self.onStructureChange?()
-            } catch {
-                self.presentError(error, title: "Couldn't create worktree")
+                DispatchQueue.main.async { self.finishAddingWorktree(outcome, result: result, in: repository) }
             }
         }
 
         let sheet = NSWindow(contentViewController: dialog)
         sheet.styleMask = [.titled]
         window.beginSheet(sheet)
+    }
+
+    private func finishAddingWorktree(
+        _ outcome: Result<Void, Error>,
+        result: NewWorktreeRequest,
+        in repository: Repository
+    ) {
+        do {
+            try outcome.get()
+            try RepositoryStore.refreshWorktrees(of: repository)
+            reload()
+
+            if let created = RepositoryStore
+                .worktrees(ofRepository: repository.id ?? -1)
+                .first(where: { $0.path == result.path }),
+               let id = created.id
+            {
+                select(.worktree(id))
+                if let node = node(for: .worktree(id)) { onSelect?(node) }
+            }
+            onStructureChange?()
+        } catch {
+            presentError(error, title: "Couldn't create worktree")
+        }
     }
 
     @objc func removeWorktree() {
@@ -635,14 +694,22 @@ final class SidebarViewController: NSViewController {
         in repository: Repository,
         force: Bool = false
     ) -> Error? {
-        do {
-            try GitService.removeWorktree(
-                repositoryPath: repository.path,
-                path: worktree.path,
-                force: force
-            )
-        } catch {
-            return error
+        // Already removed outside Workbench (or its folder deleted): nothing for
+        // git to remove, so just catch the sidebar up.
+        let known = (try? GitService.worktrees(for: repository.path)) ?? []
+        let stillThere = known.contains { $0.path == worktree.path }
+        if !stillThere || !FileManager.default.fileExists(atPath: worktree.path) {
+            if stillThere { try? GitService.pruneWorktrees(repositoryPath: repository.path) }
+        } else {
+            do {
+                try GitService.removeWorktree(
+                    repositoryPath: repository.path,
+                    path: worktree.path,
+                    force: force
+                )
+            } catch {
+                return error
+            }
         }
         try? RepositoryStore.refreshWorktrees(of: repository)
         reload()
@@ -699,15 +766,7 @@ final class SidebarViewController: NSViewController {
     }
 
     @objc private func refreshRepository() {
-        guard let node = clickedNode else { return }
-        let repository: Repository?
-        switch node.kind {
-        case .repository(let value): repository = value
-        case .newWorktree(let value): repository = value
-        case .worktree(let worktree): repository = RepositoryStore.repository(id: worktree.repositoryId)
-        case .home: repository = nil
-        }
-        guard let repository else { return }
+        guard let repository = clickedNode?.repository else { return }
 
         do {
             try RepositoryStore.refreshWorktrees(of: repository)
@@ -824,6 +883,16 @@ extension SidebarViewController: NSOutlineViewDataSource, NSOutlineViewDelegate 
         (item as? SidebarNode)?.isSelectable ?? false
     }
 
+    func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
+        let identifier = NSUserInterfaceItemIdentifier("SidebarRow")
+        return outlineView.makeView(withIdentifier: identifier, owner: self) as? SidebarRowView
+            ?? {
+                let created = SidebarRowView()
+                created.identifier = identifier
+                return created
+            }()
+    }
+
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         guard let node = item as? SidebarNode else { return nil }
 
@@ -834,15 +903,6 @@ extension SidebarViewController: NSOutlineViewDataSource, NSOutlineViewDelegate 
                 created.identifier = identifier
                 return created
             }()
-
-        // Cells are reused, so re-point the button at this row every time.
-        if case .repository = node.kind {
-            cell.showsAddButton = true
-            cell.onAdd = { [weak self] in self?.addWorktree(for: node) }
-        } else {
-            cell.showsAddButton = false
-            cell.onAdd = nil
-        }
 
         cell.configure(for: node)
         cell.shortcutNumber = node.workspaceKey.flatMap { shortcutByKey[$0] }
@@ -856,6 +916,9 @@ extension SidebarViewController: NSOutlineViewDataSource, NSOutlineViewDelegate 
         let agents = agentState(showing: node)
         cell.setAgentState(agents)
 
+        let staleDays = node.staleDays
+        cell.setStaleDays(staleDays)
+
         cell.toolTip = {
             switch node.kind {
             case .home: return NSHomeDirectory()
@@ -864,6 +927,7 @@ extension SidebarViewController: NSOutlineViewDataSource, NSOutlineViewDelegate 
             case .worktree(let worktree):
                 let lines = [
                     worktree.path,
+                    staleDays.map { "No code changes in \($0) days" },
                     pullRequest?.summary,
                     AgentStatusDotView.tooltip(for: agents),
                 ]
@@ -877,7 +941,10 @@ extension SidebarViewController: NSOutlineViewDataSource, NSOutlineViewDelegate 
     /// unfolding hands them back. Deferred, because reloading the outline from
     /// inside its own expansion callback re-enters it.
     func outlineViewItemDidExpand(_ notification: Notification) {
-        DispatchQueue.main.async { [weak self] in self?.refreshAgentStates() }
+        DispatchQueue.main.async { [weak self] in
+            self?.refreshAgentStates()
+            self?.restoreSelection()
+        }
     }
 
     func outlineViewItemDidCollapse(_ notification: Notification) {

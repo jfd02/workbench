@@ -76,10 +76,10 @@ enum RepositoryStore {
 
         let discovered = try GitService.worktrees(for: root)
 
-        return try AppDatabase.shared.queue.write { db in
+        let result = try AppDatabase.shared.queue.write { db -> (Repository, WorktreeChanges?) in
             if let existing = try Repository.filter(Column("path") == root).fetchOne(db) {
-                try syncWorktrees(discovered, repositoryId: existing.id!, in: db)
-                return existing
+                let changes = try syncWorktrees(discovered, repositoryId: existing.id!, in: db)
+                return (existing, changes)
             }
 
             let nextPosition = try Int.fetchOne(
@@ -92,9 +92,12 @@ enum RepositoryStore {
                 position: nextPosition
             )
             try repository.insert(db)
-            try syncWorktrees(discovered, repositoryId: repository.id!, in: db)
-            return repository
+            _ = try syncWorktrees(discovered, repositoryId: repository.id!, in: db)
+            // Registering a repository is a baseline, not worktree creation.
+            return (repository, nil)
         }
+        result.1?.deliver(repositoryPath: result.0.path)
+        return result.0
     }
 
     /// Re-read worktrees from git and reconcile the stored rows.
@@ -104,8 +107,31 @@ enum RepositoryStore {
     static func refreshWorktrees(of repository: Repository) throws {
         guard let repositoryId = repository.id else { return }
         let discovered = try GitService.worktrees(for: repository.path)
-        try AppDatabase.shared.queue.write { db in
+        let changes = try AppDatabase.shared.queue.write { db in
             try syncWorktrees(discovered, repositoryId: repositoryId, in: db)
+        }
+        changes.deliver(repositoryPath: repository.path)
+    }
+
+    /// Deliver only after the database commits. Repeated refreshes then have
+    /// no changes to deliver, and a rolled-back write cannot run a user script.
+    private struct WorktreeChanges {
+        var added: [Worktree] = []
+        var removed: [Worktree] = []
+
+        func deliver(repositoryPath: String) {
+            let gone = removed.filter { !FileManager.default.fileExists(atPath: $0.path) }
+            XcodeBuildFolders.removeFolders(ofRemovedWorktrees: gone.map(\.path), checkoutPath: repositoryPath)
+            RemovedWorktreeCommand.run(forRemovedWorktrees: gone.map(\.path), checkoutPath: repositoryPath)
+            for (name, worktrees) in [("worktree.created", added), ("worktree.removed", gone)] {
+                for worktree in worktrees where !worktree.isMain {
+                    WorkbenchHooks.runner.emit(HookEvent(
+                        event: name, repositoryPath: repositoryPath,
+                        worktreePath: worktree.path, branch: worktree.branch,
+                        workspaceID: worktree.id.map { WorkspaceKey.worktree($0).stateValue }
+                    ))
+                }
+            }
         }
     }
 
@@ -113,13 +139,14 @@ enum RepositoryStore {
         _ discovered: [GitWorktree],
         repositoryId: Int64,
         in db: Database
-    ) throws {
+    ) throws -> WorktreeChanges {
         let existing = try Worktree
             .filter(Column("repositoryId") == repositoryId)
             .fetchAll(db)
         var byPath = Dictionary(uniqueKeysWithValues: existing.compactMap { worktree in
             worktree.id.map { _ in (worktree.path, worktree) }
         })
+        var changes = WorktreeChanges()
 
         for (index, found) in discovered.enumerated() {
             if var row = byPath.removeValue(forKey: found.path) {
@@ -136,13 +163,18 @@ enum RepositoryStore {
                     position: index
                 )
                 try row.insert(db)
+                changes.added.append(row)
             }
         }
 
-        // Anything git no longer reports has been removed on disk.
+        // Anything git no longer reports has been removed on disk, and so can
+        // the build output Xcode tools kept for it elsewhere, and whatever else
+        // the repository asks to have cleared away.
         for (_, stale) in byPath {
             try stale.delete(db)
+            changes.removed.append(stale)
         }
+        return changes
     }
 
     /// Forget a repository. Does not touch anything on disk.
@@ -150,13 +182,6 @@ enum RepositoryStore {
         guard let id = repository.id else { return }
         try? AppDatabase.shared.queue.write { db in
             _ = try Repository.deleteOne(db, key: id)
-        }
-    }
-
-    static func removeWorktreeRow(_ worktree: Worktree) {
-        guard let id = worktree.id else { return }
-        try? AppDatabase.shared.queue.write { db in
-            _ = try Worktree.deleteOne(db, key: id)
         }
     }
 }
